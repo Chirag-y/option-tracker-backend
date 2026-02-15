@@ -19,6 +19,7 @@ app.use("/api/users", require("./routes/users"));
 app.use("/api/calendar", require("./routes/calendar"));
 app.use("/api/charts", require("./routes/charts"));
 app.use("/api/export", require("./routes/export"));
+app.use("/api/admin", require("./routes/admin"));
 
 app.use((req, res) => {
   res.status(404).json({ message: "Route not found" });

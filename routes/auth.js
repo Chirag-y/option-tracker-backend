@@ -23,7 +23,8 @@ router.post("/register", async (req, res) => {
     }
 
     const safeInvested = Number(investedAmount || 0);
-    const safeShare = Number(sharePercentage || 0);
+    const existingVerifiedCount = await User.countDocuments({ teamCode: normalizedTeamCode, isVerified: true });
+    const safeShare = Number(sharePercentage ?? (existingVerifiedCount ? 0 : 100));
     const hashed = await bcrypt.hash(password, 10);
     const user = await User.create({
       name,
@@ -33,7 +34,9 @@ router.post("/register", async (req, res) => {
       isVerified: false,
       investedAmount: safeInvested,
       currentBalance: safeInvested,
-      sharePercentage: safeShare
+      sharePercentage: safeShare,
+      pnlMode: "FUTURE_ONLY",
+      pnlEligibleFrom: new Date()
     });
 
     res.status(201).json({
@@ -66,8 +69,9 @@ router.post("/login", async (req, res) => {
       return res.status(403).json({ message: "Account pending approval. Contact admin." });
     }
 
+    const isAdmin = normalizedEmail === "cyadav591@gmail.com";
     const token = jwt.sign(
-      { id: user._id, teamCode: user.teamCode },
+      { id: user._id, teamCode: user.teamCode, email: user.email, isAdmin },
       process.env.JWT_SECRET,
       { expiresIn: "7d" }
     );
@@ -78,7 +82,10 @@ router.post("/login", async (req, res) => {
         name: user.name,
         email: user.email,
         teamCode: user.teamCode,
+        isAdmin,
         isVerified: user.isVerified,
+        pnlMode: user.pnlMode,
+        pnlEligibleFrom: user.pnlEligibleFrom,
         investedAmount: user.investedAmount,
         sharePercentage: user.sharePercentage,
         currentBalance: user.currentBalance
@@ -93,7 +100,11 @@ router.get("/me", auth, async (req, res) => {
   try {
     const user = await User.findOne({ _id: req.user.id, teamCode: req.user.teamCode }).select("-password");
     if (!user) return res.status(404).json({ message: "User not found" });
-    res.json(user);
+    res.json({
+      ...user.toObject(),
+      id: user._id,
+      isAdmin: user.email === "cyadav591@gmail.com"
+    });
   } catch (err) {
     res.status(500).json({ message: "Failed to load profile" });
   }

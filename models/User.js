@@ -8,6 +8,10 @@ const UserSchema = new mongoose.Schema({
   isVerified: { type: Boolean, default: false, index: true },
   investedAmount: { type: Number, default: 0, min: 0 },
   sharePercentage: { type: Number, default: 0, min: 0, max: 100 },
+  // FUTURE_ONLY: new member participates only from join onward.
+  // FROM_START: member participates for full history after team approval/recalculation.
+  pnlMode: { type: String, enum: ["FUTURE_ONLY", "FROM_START"], default: "FUTURE_ONLY" },
+  pnlEligibleFrom: { type: Date, default: Date.now },
   currentBalance: { type: Number, default: 0 }
 }, { timestamps: true });
 

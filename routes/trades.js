@@ -4,6 +4,7 @@ const User = require("../models/User");
 const Ledger = require("../models/Ledger");
 const calculateSplit = require("../utils/calculateSplit");
 const auth = require("../middlewares/auth.middleware");
+const teamStatus = require("../utils/teamStatus");
 
 router.get("/", auth, async (req, res) => {
   try {
@@ -52,6 +53,15 @@ router.post("/", auth, async (req, res) => {
       return res.status(400).json({ message: "instrument, optionType, resultType and numeric amount are required" });
     }
 
+    const teamUsers = await User.find({ teamCode: req.user.teamCode });
+    const status = teamStatus(teamUsers);
+    if (!status.canTrade) {
+      return res.status(400).json({
+        message: `Trade entry is blocked. ${status.message}`
+      });
+    }
+
+    const resolvedTradeDate = tradeDate ? new Date(tradeDate) : new Date();
     const safeAmount = Math.max(0, amount);
     const safeCharges = Math.max(0, Number(charges || 0));
     const finalAmount =
@@ -67,12 +77,16 @@ router.post("/", auth, async (req, res) => {
       amount: safeAmount,
       charges: safeCharges,
       finalAmount: Number(finalAmount.toFixed(2)),
-      tradeDate: tradeDate ? new Date(tradeDate) : new Date()
+      tradeDate: resolvedTradeDate
     });
 
-    const users = await User.find({ teamCode: req.user.teamCode, isVerified: true });
+    const users = teamUsers.filter((u) => {
+      if (!u.isVerified) return false;
+      const eligibleFrom = u.pnlEligibleFrom ? new Date(u.pnlEligibleFrom) : new Date(0);
+      return eligibleFrom <= resolvedTradeDate;
+    });
     if (!users.length) {
-      return res.status(400).json({ message: "No verified team members found for split" });
+      return res.status(400).json({ message: "No eligible verified team members found for this trade date" });
     }
     const splits = calculateSplit(trade.finalAmount, users);
 
