@@ -1,19 +1,19 @@
 module.exports = (users) => {
-  const verified = users.filter((u) => u.isVerified);
-  const verifiedCount = verified.length;
-  if (!verifiedCount) {
+  const activeMembers = users.filter((u) => u.isVerified && u.isTeamApproved !== false);
+  const activeCount = activeMembers.length;
+  if (!activeCount) {
     return {
       canTrade: false,
       verifiedCount: 0,
       shareTotal: 0,
-      message: "No verified team members found."
+      message: "No active team members found. Team approvals are required."
     };
   }
 
   const shareTotal = Number(
-    verified.reduce((sum, u) => sum + Number(u.sharePercentage || 0), 0).toFixed(2)
+    activeMembers.reduce((sum, u) => sum + Number(u.sharePercentage || 0), 0).toFixed(2)
   );
-  const allPositive = verified.every((u) => Number(u.sharePercentage || 0) > 0);
+  const allPositive = activeMembers.every((u) => Number(u.sharePercentage || 0) > 0);
   const sumOk = Math.abs(shareTotal - 100) <= 0.01;
   const canTrade = allPositive && sumOk;
 
@@ -26,7 +26,7 @@ module.exports = (users) => {
 
   return {
     canTrade,
-    verifiedCount,
+    verifiedCount: activeCount,
     shareTotal,
     message
   };

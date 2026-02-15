@@ -5,11 +5,16 @@ const recalculateTeam = require("../utils/recalculateTeam");
 
 const ADMIN_EMAIL = "cyadav591@gmail.com";
 
-const ensureAdmin = (req, res, next) => {
-  if (!req.user?.email || req.user.email !== ADMIN_EMAIL) {
-    return res.status(403).json({ message: "Admin access only" });
+const ensureAdmin = async (req, res, next) => {
+  try {
+    const requester = await User.findById(req.user.id).select("email");
+    if (!requester || requester.email !== ADMIN_EMAIL) {
+      return res.status(403).json({ message: "Admin access only" });
+    }
+    next();
+  } catch (err) {
+    res.status(500).json({ message: "Failed to verify admin access" });
   }
-  next();
 };
 
 router.get("/overview", auth, ensureAdmin, async (req, res) => {
@@ -50,9 +55,33 @@ router.patch("/users/:id/verify", auth, ensureAdmin, async (req, res) => {
     if (!user) return res.status(404).json({ message: "User not found" });
 
     user.isVerified = isVerified;
-    if (isVerified && !user.pnlEligibleFrom) {
-      user.pnlEligibleFrom = new Date();
-      user.pnlMode = "FUTURE_ONLY";
+    if (isVerified) {
+      if (!user.pnlEligibleFrom) {
+        user.pnlEligibleFrom = new Date();
+      }
+      if (!user.pnlMode) user.pnlMode = "FUTURE_ONLY";
+
+      const activeInTeam = await User.countDocuments({
+        teamCode: user.teamCode,
+        _id: { $ne: user._id },
+        isVerified: true,
+        isTeamApproved: { $ne: false }
+      });
+      if (activeInTeam === 0) {
+        user.isTeamApproved = true;
+        user.teamApprovalState = "APPROVED";
+        user.teamApprovedAt = new Date();
+        user.teamApprovedBy = null;
+        user.pnlModeLocked = true;
+      } else if (!user.isTeamApproved) {
+        user.teamApprovalState = "PENDING";
+      }
+    } else {
+      user.isTeamApproved = false;
+      user.teamApprovalState = "PENDING";
+      user.teamApprovedAt = null;
+      user.teamApprovedBy = null;
+      user.pnlModeLocked = false;
     }
     await user.save();
     await recalculateTeam(user.teamCode);

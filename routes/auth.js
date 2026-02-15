@@ -24,6 +24,7 @@ router.post("/register", async (req, res) => {
 
     const safeInvested = Number(investedAmount || 0);
     const existingVerifiedCount = await User.countDocuments({ teamCode: normalizedTeamCode, isVerified: true });
+    const isFounder = existingVerifiedCount === 0;
     const safeShare = Number(sharePercentage ?? (existingVerifiedCount ? 0 : 100));
     const hashed = await bcrypt.hash(password, 10);
     const user = await User.create({
@@ -32,10 +33,14 @@ router.post("/register", async (req, res) => {
       password: hashed,
       teamCode: normalizedTeamCode,
       isVerified: false,
+      isTeamApproved: isFounder,
+      teamApprovalState: isFounder ? "APPROVED" : "PENDING",
+      teamApprovedAt: isFounder ? new Date() : null,
       investedAmount: safeInvested,
       currentBalance: safeInvested,
       sharePercentage: safeShare,
       pnlMode: "FUTURE_ONLY",
+      pnlModeLocked: isFounder,
       pnlEligibleFrom: new Date()
     });
 
@@ -68,8 +73,12 @@ router.post("/login", async (req, res) => {
     if (!user.isVerified) {
       return res.status(403).json({ message: "Account pending approval. Contact admin." });
     }
+    if (user.teamApprovalState === "REJECTED") {
+      return res.status(403).json({ message: "Team membership request was rejected. Contact your team." });
+    }
 
     const isAdmin = normalizedEmail === "cyadav591@gmail.com";
+    const isTeamApproved = user.isTeamApproved !== false;
     const token = jwt.sign(
       { id: user._id, teamCode: user.teamCode, email: user.email, isAdmin },
       process.env.JWT_SECRET,
@@ -84,6 +93,8 @@ router.post("/login", async (req, res) => {
         teamCode: user.teamCode,
         isAdmin,
         isVerified: user.isVerified,
+        isTeamApproved,
+        teamApprovalState: user.teamApprovalState || (isTeamApproved ? "APPROVED" : "PENDING"),
         pnlMode: user.pnlMode,
         pnlEligibleFrom: user.pnlEligibleFrom,
         investedAmount: user.investedAmount,
@@ -100,9 +111,12 @@ router.get("/me", auth, async (req, res) => {
   try {
     const user = await User.findOne({ _id: req.user.id, teamCode: req.user.teamCode }).select("-password");
     if (!user) return res.status(404).json({ message: "User not found" });
+    const isTeamApproved = user.isTeamApproved !== false;
     res.json({
       ...user.toObject(),
       id: user._id,
+      isTeamApproved,
+      teamApprovalState: user.teamApprovalState || (isTeamApproved ? "APPROVED" : "PENDING"),
       isAdmin: user.email === "cyadav591@gmail.com"
     });
   } catch (err) {

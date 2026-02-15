@@ -1,11 +1,12 @@
 const Trade = require("../models/Trade");
 const User = require("../models/User");
 const Ledger = require("../models/Ledger");
+const Withdrawal = require("../models/Withdrawal");
 const calculateSplit = require("./calculateSplit");
 
 module.exports = async (teamCode) => {
   const users = await User.find({ teamCode });
-  const verified = users.filter((u) => u.isVerified);
+  const activeMembers = users.filter((u) => u.isVerified && u.isTeamApproved !== false);
   const userMap = new Map(
     users.map((u) => [
       String(u._id),
@@ -21,7 +22,7 @@ module.exports = async (teamCode) => {
 
   for (const trade of trades) {
     const tradeDate = new Date(trade.tradeDate);
-    const eligible = verified.filter((u) => {
+    const eligible = activeMembers.filter((u) => {
       const eligibleFrom = u.pnlEligibleFrom ? new Date(u.pnlEligibleFrom) : new Date(0);
       return eligibleFrom <= tradeDate;
     });
@@ -41,6 +42,14 @@ module.exports = async (teamCode) => {
         balanceAfter: userState.balance
       });
     }
+  }
+
+  const withdrawals = await Withdrawal.find({ teamCode }).sort({ withdrawalDate: 1, createdAt: 1 });
+  for (const wd of withdrawals) {
+    const key = String(wd.userId);
+    const userState = userMap.get(key);
+    if (!userState) continue;
+    userState.balance = Number((userState.balance - Number(wd.amount || 0)).toFixed(2));
   }
 
   for (const [, state] of userMap) {

@@ -5,10 +5,11 @@ const Ledger = require("../models/Ledger");
 const calculateSplit = require("../utils/calculateSplit");
 const auth = require("../middlewares/auth.middleware");
 const teamStatus = require("../utils/teamStatus");
+const recalculateTeam = require("../utils/recalculateTeam");
 
 router.get("/", auth, async (req, res) => {
   try {
-    const { month } = req.query;
+    const { month, resultType, instrument, period, startDate, endDate } = req.query;
     const query = { teamCode: req.user.teamCode };
 
     if (month) {
@@ -16,6 +17,33 @@ router.get("/", auth, async (req, res) => {
       const end = new Date(start);
       end.setUTCMonth(end.getUTCMonth() + 1);
       query.tradeDate = { $gte: start, $lt: end };
+    }
+    if (resultType === "PROFIT" || resultType === "LOSS") {
+      query.resultType = resultType;
+    }
+    if (instrument && instrument !== "ALL") {
+      query.instrument = instrument;
+    }
+    if (period) {
+      const now = new Date();
+      let start = null;
+      let end = null;
+      if (period === "THIS_MONTH") {
+        start = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
+        end = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1));
+      } else if (period === "THIS_YEAR") {
+        start = new Date(Date.UTC(now.getUTCFullYear(), 0, 1));
+        end = new Date(Date.UTC(now.getUTCFullYear() + 1, 0, 1));
+      } else if (period === "PAST_MONTH") {
+        start = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 1, 1));
+        end = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
+      } else if (period === "CUSTOM" && startDate && endDate) {
+        start = new Date(`${startDate}T00:00:00.000Z`);
+        end = new Date(`${endDate}T23:59:59.999Z`);
+      }
+      if (start && end) {
+        query.tradeDate = { $gte: start, $lte: end };
+      }
     }
 
     const trades = await Trade.find(query).sort({ tradeDate: -1, createdAt: -1 });
@@ -81,7 +109,7 @@ router.post("/", auth, async (req, res) => {
     });
 
     const users = teamUsers.filter((u) => {
-      if (!u.isVerified) return false;
+      if (!u.isVerified || u.isTeamApproved === false) return false;
       const eligibleFrom = u.pnlEligibleFrom ? new Date(u.pnlEligibleFrom) : new Date(0);
       return eligibleFrom <= resolvedTradeDate;
     });
@@ -115,18 +143,52 @@ router.delete("/:id", auth, async (req, res) => {
     const trade = await Trade.findOne({ _id: req.params.id, teamCode: req.user.teamCode });
     if (!trade) return res.status(404).json({ message: "Trade not found" });
 
-    const ledgers = await Ledger.find({ tradeId: req.params.id, teamCode: req.user.teamCode });
-    for (const l of ledgers) {
-      const user = await User.findOne({ _id: l.userId, teamCode: req.user.teamCode });
-      if (!user) continue;
-      user.currentBalance = Number((user.currentBalance - l.amountChange).toFixed(2));
-      await user.save();
-    }
     await Ledger.deleteMany({ tradeId: req.params.id, teamCode: req.user.teamCode });
     await Trade.deleteOne({ _id: req.params.id, teamCode: req.user.teamCode });
+    await recalculateTeam(req.user.teamCode);
     res.json({ message: "Trade deleted with rollback" });
   } catch (err) {
     res.status(500).json({ message: "Failed to delete trade" });
+  }
+});
+
+router.patch("/:id", auth, async (req, res) => {
+  try {
+    const trade = await Trade.findOne({ _id: req.params.id, teamCode: req.user.teamCode });
+    if (!trade) return res.status(404).json({ message: "Trade not found" });
+
+    const {
+      instrument,
+      optionType,
+      strikePrice,
+      resultType,
+      amount,
+      charges,
+      tradeDate
+    } = req.body;
+
+    if (!instrument || !resultType || typeof amount !== "number" || typeof charges !== "number" || !tradeDate) {
+      return res.status(400).json({ message: "instrument, resultType, amount, charges and tradeDate are required" });
+    }
+
+    const safeAmount = Math.max(0, amount);
+    const safeCharges = Math.max(0, charges);
+    const finalAmount = resultType === "PROFIT" ? safeAmount - safeCharges : -(safeAmount + safeCharges);
+
+    trade.instrument = String(instrument).trim();
+    trade.optionType = optionType || trade.optionType;
+    trade.strikePrice = Number(strikePrice || 0);
+    trade.resultType = resultType;
+    trade.amount = safeAmount;
+    trade.charges = safeCharges;
+    trade.finalAmount = Number(finalAmount.toFixed(2));
+    trade.tradeDate = new Date(tradeDate);
+    await trade.save();
+
+    await recalculateTeam(req.user.teamCode);
+    res.json(trade);
+  } catch (err) {
+    res.status(500).json({ message: "Failed to update trade" });
   }
 });
 
