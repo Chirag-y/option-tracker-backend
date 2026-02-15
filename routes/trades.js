@@ -70,7 +70,10 @@ router.post("/", auth, async (req, res) => {
       tradeDate: tradeDate ? new Date(tradeDate) : new Date()
     });
 
-    const users = await User.find({ teamCode: req.user.teamCode });
+    const users = await User.find({ teamCode: req.user.teamCode, isVerified: true });
+    if (!users.length) {
+      return res.status(400).json({ message: "No verified team members found for split" });
+    }
     const splits = calculateSplit(trade.finalAmount, users);
 
     for (const s of splits) {

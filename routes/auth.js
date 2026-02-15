@@ -30,6 +30,7 @@ router.post("/register", async (req, res) => {
       email: normalizedEmail,
       password: hashed,
       teamCode: normalizedTeamCode,
+      isVerified: false,
       investedAmount: safeInvested,
       currentBalance: safeInvested,
       sharePercentage: safeShare
@@ -39,7 +40,9 @@ router.post("/register", async (req, res) => {
       id: user._id,
       name: user.name,
       email: user.email,
-      teamCode: user.teamCode
+      teamCode: user.teamCode,
+      isVerified: user.isVerified,
+      message: "Registration submitted. Account will be active after admin approval."
     });
   } catch (err) {
     res.status(500).json({ message: "Failed to register user" });
@@ -59,6 +62,9 @@ router.post("/login", async (req, res) => {
     if (!user || !(await bcrypt.compare(password, user.password))) {
       return res.status(401).json({ message: "Invalid credentials" });
     }
+    if (!user.isVerified) {
+      return res.status(403).json({ message: "Account pending approval. Contact admin." });
+    }
 
     const token = jwt.sign(
       { id: user._id, teamCode: user.teamCode },
@@ -72,6 +78,7 @@ router.post("/login", async (req, res) => {
         name: user.name,
         email: user.email,
         teamCode: user.teamCode,
+        isVerified: user.isVerified,
         investedAmount: user.investedAmount,
         sharePercentage: user.sharePercentage,
         currentBalance: user.currentBalance
