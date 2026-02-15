@@ -40,7 +40,7 @@ module.exports = async (teamCode) => {
     if (!eligible.length) continue;
 
     const splits = calculateSplit(trade.finalAmount, eligible);
-    console.log({ splits });
+    // console.log({ splits });
     for (const split of splits) {
       const key = String(split.userId);
       const userState = userMap.get(key);
