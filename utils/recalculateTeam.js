@@ -32,9 +32,9 @@ module.exports = async (teamCode) => {
           : new Date();
       }
       // const eligibleFrom = u.pnlEligibleFrom ? new Date(u.pnlEligibleFrom) : new Date(0);
-      if(index == 0){
-        console.log({ recalculateEligibl: eligibleFrom, tradeDate, user: u, index });
-      }
+      // if(index == 0){
+      //   console.log({ recalculateEligibl: eligibleFrom, tradeDate, user: u, index });
+      // }
       return eligibleFrom <= tradeDate;
     });
     if (!eligible.length) continue;
