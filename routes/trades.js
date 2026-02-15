@@ -111,16 +111,19 @@ router.post("/", auth, async (req, res) => {
     const users = teamUsers.filter((u) => {
       if (!u.isVerified || u.isTeamApproved === false) return false;
       const eligibleFrom = u.pnlEligibleFrom ? new Date(u.pnlEligibleFrom) : new Date(0);
+      console.log({u, eligibleFrom, resolvedTradeDate});
       return eligibleFrom <= resolvedTradeDate;
     });
     if (!users.length) {
       return res.status(400).json({ message: "No eligible verified team members found for this trade date" });
     }
     const splits = calculateSplit(trade.finalAmount, users);
-
+    console.log({splits});
+    
     for (const s of splits) {
       const user = await User.findOne({ _id: s.userId, teamCode: req.user.teamCode });
       user.currentBalance = Number((user.currentBalance + s.amountChange).toFixed(2));
+      console.log({user});
       await user.save();
 
       await Ledger.create({

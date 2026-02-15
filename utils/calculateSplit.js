@@ -10,7 +10,7 @@ module.exports = (finalAmount, users) => {
     userId: u._id,
     amountChange: (finalAmount * Number(u.sharePercentage || 0)) / totalShare
   }));
-
+  console.log({users})
   const rounded = changes.map((c) => ({
     ...c,
     amountChange: Number(c.amountChange.toFixed(2))

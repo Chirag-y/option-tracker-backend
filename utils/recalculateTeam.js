@@ -7,6 +7,7 @@ const calculateSplit = require("./calculateSplit");
 module.exports = async (teamCode) => {
   const users = await User.find({ teamCode });
   const activeMembers = users.filter((u) => u.isVerified && u.isTeamApproved !== false);
+  console.log({users, activeMembers})
   const userMap = new Map(
     users.map((u) => [
       String(u._id),
@@ -23,12 +24,15 @@ module.exports = async (teamCode) => {
   for (const trade of trades) {
     const tradeDate = new Date(trade.tradeDate);
     const eligible = activeMembers.filter((u) => {
+      console.log({recalculateUser:u});
       const eligibleFrom = u.pnlEligibleFrom ? new Date(u.pnlEligibleFrom) : new Date(0);
+      console.log({recalculateEligibl:eligibleFrom, tradeDate});
       return eligibleFrom <= tradeDate;
     });
     if (!eligible.length) continue;
 
     const splits = calculateSplit(trade.finalAmount, eligible);
+    console.log({splits});
     for (const split of splits) {
       const key = String(split.userId);
       const userState = userMap.get(key);
