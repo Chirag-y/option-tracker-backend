@@ -167,6 +167,7 @@ router.patch("/me", auth, async (req, res) => {
     await recalculateTeam(req.user.teamCode);
     res.json(user);
   } catch (err) {
+    console.log({err});
     res.status(500).json({ message: "Failed to update profile" });
   }
 });
