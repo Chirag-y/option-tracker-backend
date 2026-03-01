@@ -6,6 +6,7 @@ const calculateSplit = require("../utils/calculateSplit");
 const auth = require("../middlewares/auth.middleware");
 const teamStatus = require("../utils/teamStatus");
 const recalculateTeam = require("../utils/recalculateTeam");
+const notifyTeam = require("../utils/notifyTeam");
 
 router.get("/", auth, async (req, res) => {
   try {
@@ -111,19 +112,19 @@ router.post("/", auth, async (req, res) => {
     const users = teamUsers.filter((u) => {
       if (!u.isVerified || u.isTeamApproved === false) return false;
       const eligibleFrom = u.pnlEligibleFrom ? new Date(u.pnlEligibleFrom) : new Date(0);
-      console.log({u, eligibleFrom, resolvedTradeDate});
+      // console.log({u, eligibleFrom, resolvedTradeDate});
       return eligibleFrom <= resolvedTradeDate;
     });
     if (!users.length) {
       return res.status(400).json({ message: "No eligible verified team members found for this trade date" });
     }
     const splits = calculateSplit(trade.finalAmount, users);
-    console.log({splits});
+    // console.log({splits});
     
     for (const s of splits) {
       const user = await User.findOne({ _id: s.userId, teamCode: req.user.teamCode });
       user.currentBalance = Number((user.currentBalance + s.amountChange).toFixed(2));
-      console.log({user});
+      // console.log({user});
       await user.save();
 
       await Ledger.create({
@@ -133,6 +134,33 @@ router.post("/", auth, async (req, res) => {
         amountChange: s.amountChange,
         balanceAfter: user.currentBalance
       });
+    }
+
+    try {
+      const recipients = teamUsers.filter(
+        (u) =>
+          String(u._id) !== String(req.user.id) &&
+          u.isVerified &&
+          u.isTeamApproved !== false
+      );
+      const actor = teamUsers.find((u) => String(u._id) === String(req.user.id));
+      const recipientPlayerIds = recipients.reduce((acc, user) => {
+        const ids = Array.isArray(user.onesignalPlayerIds) ? user.onesignalPlayerIds : [];
+        ids.forEach((id) => {
+          if (id && !acc.includes(id)) {
+            acc.push(id);
+          }
+        });
+        return acc;
+      }, []);
+      await notifyTeam({
+        recipientIds: recipients.map((u) => String(u._id)),
+        recipientPlayerIds,
+        trade,
+        sender: actor?.name || req.user.email
+      });
+    } catch (notifErr) {
+      console.error("Failed to send notification", notifErr?.message || notifErr);
     }
 
     res.status(201).json(trade);

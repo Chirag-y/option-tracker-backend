@@ -20,32 +20,79 @@ module.exports = async (teamCode) => {
   await Ledger.deleteMany({ teamCode });
   const trades = await Trade.find({ teamCode }).sort({ tradeDate: 1, createdAt: 1 });
 
-  for (const trade of trades) {
+  // for (const trade of trades) {
+  //   const tradeDate = new Date(trade.tradeDate);
+  //   const eligible = activeMembers.filter((u, index) => {
+  //     let eligibleFrom;
+  //     if (u.pnlMode === "FROM_START") {
+  //       eligibleFrom = new Date(0);
+  //     } else {
+  //       eligibleFrom = u.pnlEligibleFrom
+  //         ? new Date(u.pnlEligibleFrom)
+  //         : new Date();
+  //     }
+  //     // const eligibleFrom = u.pnlEligibleFrom ? new Date(u.pnlEligibleFrom) : new Date(0);
+  //     // if(index == 0){
+  //     //   console.log({ recalculateEligibl: eligibleFrom, tradeDate, user: u, index });
+  //     // }
+  //     return eligibleFrom <= tradeDate;
+  //   });
+  //   if (!eligible.length) continue;
+
+  //   const splits = calculateSplit(trade.finalAmount, eligible);
+  //   // console.log({ splits });
+  //   for (const split of splits) {
+  //     const key = String(split.userId);
+  //     const userState = userMap.get(key);
+  //     if (!userState) continue;
+  //     userState.balance = Number((userState.balance + split.amountChange).toFixed(2));
+  //     await Ledger.create({
+  //       teamCode,
+  //       tradeId: trade._id,
+  //       userId: split.userId,
+  //       amountChange: split.amountChange,
+  //       balanceAfter: userState.balance
+  //     });
+  //   }
+  // }
+
+  for (let i = 0; i < trades.length; i++) {
+    const trade = trades[i];
     const tradeDate = new Date(trade.tradeDate);
+
+
     const eligible = activeMembers.filter((u, index) => {
       let eligibleFrom;
+      if(i== 0){
+        // console.log({user: u})
+      }
       if (u.pnlMode === "FROM_START") {
         eligibleFrom = new Date(0);
       } else {
         eligibleFrom = u.pnlEligibleFrom
-          ? new Date(u.pnlEligibleFrom)
-          : new Date();
+        ? new Date(u.pnlEligibleFrom)
+        : new Date();
       }
-      // const eligibleFrom = u.pnlEligibleFrom ? new Date(u.pnlEligibleFrom) : new Date(0);
-      // if(index == 0){
-      //   console.log({ recalculateEligibl: eligibleFrom, tradeDate, user: u, index });
-      // }
+      
+      if(i== 0){
+        // console.log({tradeDate, eligibleFrom})
+      }
       return eligibleFrom <= tradeDate;
     });
+    // console.log({eligible});
     if (!eligible.length) continue;
 
     const splits = calculateSplit(trade.finalAmount, eligible);
-    // console.log({ splits });
+    // console.log({splits});
     for (const split of splits) {
       const key = String(split.userId);
       const userState = userMap.get(key);
       if (!userState) continue;
-      userState.balance = Number((userState.balance + split.amountChange).toFixed(2));
+      userState.balance = Number(
+        (userState.balance + split.amountChange).toFixed(2)
+      );
+      // console.log({userState});
+
       await Ledger.create({
         teamCode,
         tradeId: trade._id,

@@ -22,7 +22,8 @@ const UserSchema = new mongoose.Schema({
   pnlMode: { type: String, enum: ["FUTURE_ONLY", "FROM_START"], default: "FUTURE_ONLY" },
   pnlModeLocked: { type: Boolean, default: false },
   pnlEligibleFrom: { type: Date, default: Date.now },
-  currentBalance: { type: Number, default: 0 }
+  currentBalance: { type: Number, default: 0 },
+  onesignalPlayerIds: { type: [String], default: [] }
 }, { timestamps: true });
 
 UserSchema.index({ email: 1, teamCode: 1 }, { unique: true });

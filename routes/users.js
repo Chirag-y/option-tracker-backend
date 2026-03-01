@@ -5,6 +5,7 @@ const Withdrawal = require("../models/Withdrawal");
 const auth = require("../middlewares/auth.middleware");
 const teamStatus = require("../utils/teamStatus");
 const recalculateTeam = require("../utils/recalculateTeam");
+const Ledger = require("../models/Ledger");
 const getRequester = async (req) =>
   User.findOne({ _id: req.user.id, teamCode: req.user.teamCode });
 
@@ -28,6 +29,33 @@ router.get("/team-status", auth, async (req, res) => {
     });
   } catch (err) {
     res.status(500).json({ message: "Failed to load team status" });
+  }
+});
+
+router.get("/me/results", auth, async (req, res) => {
+  try {
+    const ledgerEntries = await Ledger.find({ userId: req.user.id, teamCode: req.user.teamCode }).populate({
+      path: "tradeId",
+      select: "tradeDate"
+    });
+    const now = new Date();
+    const monthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
+    const nextMonthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1));
+    const monthlyChange = ledgerEntries.reduce((sum, entry) => {
+      const tradeDate = entry.tradeId?.tradeDate ? new Date(entry.tradeId.tradeDate) : null;
+      if (tradeDate && tradeDate >= monthStart && tradeDate < nextMonthStart) {
+        return sum + Number(entry.amountChange || 0);
+      }
+      return sum;
+    }, 0);
+    const user = await User.findById(req.user.id);
+    const totalChange = Number(((user?.currentBalance || 0) - (user?.investedAmount || 0)).toFixed(2));
+    res.json({
+      monthlyChange: Number(monthlyChange.toFixed(2)),
+      totalChange
+    });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to load results" });
   }
 });
 
@@ -163,8 +191,9 @@ router.patch("/me", auth, async (req, res) => {
       { new: true }
     ).select("-password");
     if (!user) return res.status(404).json({ message: "User not found" });
-
-    await recalculateTeam(req.user.teamCode);
+    // console.log("user",user);
+    const data = await recalculateTeam(req.user.teamCode);
+    console.log({data});
     res.json(user);
   } catch (err) {
     console.log({err});
@@ -204,6 +233,37 @@ router.get("/me/withdrawals", auth, async (req, res) => {
     res.json(withdrawals);
   } catch (err) {
     res.status(500).json({ message: "Failed to load withdrawals" });
+  }
+});
+
+router.post("/me/onesignal", auth, async (req, res) => {
+  try {
+    const { playerId } = req.body;
+    if (!playerId) {
+      return res.status(400).json({ message: "playerId is required" });
+    }
+
+    await User.updateOne(
+      { _id: req.user.id, teamCode: req.user.teamCode },
+      { $addToSet: { onesignalPlayerIds: playerId } }
+    );
+    res.json({ message: "OneSignal player registered" });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to register OneSignal player" });
+  }
+});
+
+router.delete("/me/onesignal", auth, async (req, res) => {
+  try {
+    const { playerId } = req.body || {};
+    const update = playerId
+      ? { $pull: { onesignalPlayerIds: playerId } }
+      : { $set: { onesignalPlayerIds: [] } };
+
+    await User.updateOne({ _id: req.user.id, teamCode: req.user.teamCode }, update);
+    res.json({ message: "OneSignal player cleared" });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to clear OneSignal player" });
   }
 });
 
