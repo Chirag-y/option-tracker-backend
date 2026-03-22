@@ -5,7 +5,8 @@ const Withdrawal = require("../models/Withdrawal");
 const auth = require("../middlewares/auth.middleware");
 const teamStatus = require("../utils/teamStatus");
 const recalculateTeam = require("../utils/recalculateTeam");
-const Ledger = require("../models/Ledger");
+const calculateSplit = require("../utils/calculateSplit");
+const Trade = require("../models/Trade");
 const getRequester = async (req) =>
   User.findOne({ _id: req.user.id, teamCode: req.user.teamCode });
 
@@ -34,20 +35,41 @@ router.get("/team-status", auth, async (req, res) => {
 
 router.get("/me/results", auth, async (req, res) => {
   try {
-    const ledgerEntries = await Ledger.find({ userId: req.user.id, teamCode: req.user.teamCode }).populate({
-      path: "tradeId",
-      select: "tradeDate"
-    });
     const now = new Date();
     const monthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
     const nextMonthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1));
-    const monthlyChange = ledgerEntries.reduce((sum, entry) => {
-      const tradeDate = entry.tradeId?.tradeDate ? new Date(entry.tradeId.tradeDate) : null;
-      if (tradeDate && tradeDate >= monthStart && tradeDate < nextMonthStart) {
-        return sum + Number(entry.amountChange || 0);
+
+    const [teamUsers, monthTrades] = await Promise.all([
+      User.find({ teamCode: req.user.teamCode }),
+      Trade.find({
+        teamCode: req.user.teamCode,
+        tradeDate: { $gte: monthStart, $lt: nextMonthStart }
+      }).sort({ tradeDate: 1, createdAt: 1 })
+    ]);
+
+    const currentUserId = String(req.user.id);
+    const monthlyChange = monthTrades.reduce((sum, trade) => {
+      const tradeDate = new Date(trade.tradeDate);
+      const eligibleUsers = teamUsers.filter((user) => {
+        if (!user.isVerified || user.isTeamApproved === false) return false;
+        const eligibleFrom =
+          user.pnlMode === "FROM_START"
+            ? new Date(0)
+            : user.pnlEligibleFrom
+              ? new Date(user.pnlEligibleFrom)
+              : new Date();
+        return eligibleFrom <= tradeDate;
+      });
+
+      if (!eligibleUsers.length) {
+        return sum;
       }
-      return sum;
+
+      const splits = calculateSplit(Number(trade.finalAmount || 0), eligibleUsers);
+      const userSplit = splits.find((split) => String(split.userId) === currentUserId);
+      return sum + Number(userSplit?.amountChange || 0);
     }, 0);
+
     const user = await User.findById(req.user.id);
     const totalChange = Number(((user?.currentBalance || 0) - (user?.investedAmount || 0)).toFixed(2));
     res.json({
@@ -193,7 +215,7 @@ router.patch("/me", auth, async (req, res) => {
     if (!user) return res.status(404).json({ message: "User not found" });
     // console.log("user",user);
     const data = await recalculateTeam(req.user.teamCode);
-    console.log({data});
+    // console.log({data});
     res.json(user);
   } catch (err) {
     console.log({err});
