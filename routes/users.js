@@ -300,6 +300,36 @@ router.get("/team-withdrawals", auth, async (req, res) => {
   }
 });
 
+router.delete("/team-withdrawals/:withdrawalId", auth, async (req, res) => {
+  try {
+    const requester = await getRequester(req);
+    if (!requester || requester.isTeamApproved === false) {
+      return res.status(403).json({ message: "Team membership approval required to manage withdrawals" });
+    }
+
+    const withdrawal = await Withdrawal.findOne({
+      _id: req.params.withdrawalId,
+      teamCode: req.user.teamCode
+    });
+
+    if (!withdrawal) {
+      return res.status(404).json({ message: "Withdrawal not found" });
+    }
+
+    const isOwner = String(withdrawal.userId) === String(req.user.id);
+    if (!req.user.isAdmin && !isOwner) {
+      return res.status(403).json({ message: "You can only delete your own withdrawals" });
+    }
+
+    await Withdrawal.deleteOne({ _id: withdrawal._id, teamCode: req.user.teamCode });
+
+    await recalculateTeam(req.user.teamCode);
+    res.json({ message: "Withdrawal deleted successfully" });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to delete withdrawal" });
+  }
+});
+
 router.post("/me/withdrawals", auth, async (req, res) => {
   try {
     const { amount, withdrawalDate, note } = req.body;
