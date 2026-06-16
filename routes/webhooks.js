@@ -1,6 +1,8 @@
 const express = require("express");
 const router = express.Router();
+const User = require("../models/User");
 const WebhookEvent = require("../models/WebhookEvent");
+const { sendPushToUsers } = require("../utils/onesignal");
 
 const parsePayload = (body) => {
   if (typeof body !== "string") {
@@ -32,6 +34,91 @@ const sanitizeHeaders = (headers) => ({
   "x-real-ip": headers["x-real-ip"]
 });
 
+const splitCsv = (value) =>
+  String(value || "")
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+
+const formatChartinkAlert = (payload) => {
+  if (!payload.stocks && !payload.scan_name && !payload.alert_name) {
+    return null;
+  }
+
+  const stocks = splitCsv(payload.stocks);
+  const prices = splitCsv(payload.trigger_prices);
+  const pairs = stocks.map((stock, index) => {
+    const price = prices[index];
+    return price ? `${stock} @ ${price}` : stock;
+  });
+
+  const title = String(payload.alert_name || payload.scan_name || "Chartink alert").trim();
+  const messageParts = [];
+  if (pairs.length) {
+    messageParts.push(pairs.slice(0, 8).join(", "));
+  }
+  if (stocks.length > 8) {
+    messageParts.push(`+${stocks.length - 8} more`);
+  }
+  if (payload.triggered_at) {
+    messageParts.push(`at ${payload.triggered_at}`);
+  }
+
+  return {
+    title,
+    message: messageParts.join(" ") || "Chartink alert triggered"
+  };
+};
+
+const getWebhookText = (payload, source) => {
+  const chartinkAlert = formatChartinkAlert(payload);
+  if (chartinkAlert) {
+    return chartinkAlert;
+  }
+
+  const title = String(payload.title || payload.heading || `${source} alert`).trim();
+  const message = String(
+    payload.message ||
+    payload.content ||
+    payload.alert ||
+    payload.text ||
+    payload.raw ||
+    "New webhook alert received"
+  ).trim();
+
+  return {
+    title: title || "Webhook alert",
+    message: message || "New webhook alert received"
+  };
+};
+
+const notifyAllUsers = async ({ payload, source, eventType, eventId }) => {
+  const users = await User.find({
+    isVerified: true,
+    isTeamApproved: { $ne: false }
+  }).select("_id");
+  const recipientIds = users.map((user) => String(user._id));
+  const { title, message } = getWebhookText(payload, source);
+
+  const result = await sendPushToUsers({
+    recipientIds,
+    name: "webhook-alert",
+    headings: { en: title },
+    contents: { en: message },
+    data: {
+      type: "webhook_alert",
+      webhookEventId: String(eventId),
+      source,
+      eventType
+    }
+  });
+
+  return {
+    attempted: recipientIds.length,
+    onesignal: result
+  };
+};
+
 router.get("/", (req, res) => {
   res.json({
     status: "ok",
@@ -62,11 +149,28 @@ router.post("/", express.text({ type: "*/*", limit: "1mb" }), async (req, res) =
       receivedAt: new Date()
     });
 
+    let notification = { attempted: 0, onesignal: null };
+    try {
+      notification = await notifyAllUsers({
+        payload,
+        source,
+        eventType,
+        eventId: event._id
+      });
+    } catch (notifErr) {
+      console.error("Webhook notification failed:", notifErr?.response?.data || notifErr?.message || notifErr);
+      notification = {
+        attempted: 0,
+        error: "Failed to send OneSignal notification"
+      };
+    }
+
     res.status(202).json({
       message: "Webhook received",
       id: event._id,
       source,
-      eventType
+      eventType,
+      notification
     });
   } catch (err) {
     console.error("Webhook receive failed:", err?.message || err);
