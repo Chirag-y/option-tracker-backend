@@ -144,18 +144,8 @@ router.post("/", auth, async (req, res) => {
           u.isTeamApproved !== false
       );
       const actor = teamUsers.find((u) => String(u._id) === String(req.user.id));
-      const recipientPlayerIds = recipients.reduce((acc, user) => {
-        const ids = Array.isArray(user.onesignalPlayerIds) ? user.onesignalPlayerIds : [];
-        ids.forEach((id) => {
-          if (id && !acc.includes(id)) {
-            acc.push(id);
-          }
-        });
-        return acc;
-      }, []);
       await notifyTeam({
         recipientIds: recipients.map((u) => String(u._id)),
-        recipientPlayerIds,
         trade,
         sender: actor?.name || req.user.email
       });
