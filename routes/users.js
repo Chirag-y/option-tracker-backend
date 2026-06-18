@@ -206,6 +206,12 @@ router.patch("/me", auth, async (req, res) => {
     if (typeof req.body.name === "string" && req.body.name.trim()) {
       updates.name = req.body.name.trim();
     }
+    if (typeof req.body.tradeResultNotificationsEnabled === "boolean") {
+      updates.tradeResultNotificationsEnabled = req.body.tradeResultNotificationsEnabled;
+    }
+    if (typeof req.body.intradayStockAlertsEnabled === "boolean") {
+      updates.intradayStockAlertsEnabled = req.body.intradayStockAlertsEnabled;
+    }
 
     const user = await User.findOneAndUpdate(
       { _id: req.user.id, teamCode: req.user.teamCode },
@@ -213,12 +219,9 @@ router.patch("/me", auth, async (req, res) => {
       { new: true }
     ).select("-password");
     if (!user) return res.status(404).json({ message: "User not found" });
-    // console.log("user",user);
-    const data = await recalculateTeam(req.user.teamCode);
-    // console.log({data});
+    await recalculateTeam(req.user.teamCode);
     res.json(user);
   } catch (err) {
-    console.log({err});
     res.status(500).json({ message: "Failed to update profile" });
   }
 });

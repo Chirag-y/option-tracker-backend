@@ -3,6 +3,7 @@ const router = express.Router();
 const User = require("../models/User");
 const WebhookEvent = require("../models/WebhookEvent");
 const { sendPushToUsers } = require("../utils/onesignal");
+const { buildWebhookNotificationText, createNotification } = require("../utils/notifications");
 
 const parsePayload = (body) => {
   if (typeof body !== "string") {
@@ -34,71 +35,14 @@ const sanitizeHeaders = (headers) => ({
   "x-real-ip": headers["x-real-ip"]
 });
 
-const splitCsv = (value) =>
-  String(value || "")
-    .split(",")
-    .map((item) => item.trim())
-    .filter(Boolean);
-
-const formatChartinkAlert = (payload) => {
-  if (!payload.stocks && !payload.scan_name && !payload.alert_name) {
-    return null;
-  }
-
-  const stocks = splitCsv(payload.stocks);
-  const prices = splitCsv(payload.trigger_prices);
-  const pairs = stocks.map((stock, index) => {
-    const price = prices[index];
-    return price ? `${stock} @ ${price}` : stock;
-  });
-
-  const title = String(payload.alert_name || payload.scan_name || "Chartink alert").trim();
-  const messageParts = [];
-  if (pairs.length) {
-    messageParts.push(pairs.slice(0, 8).join(", "));
-  }
-  if (stocks.length > 8) {
-    messageParts.push(`+${stocks.length - 8} more`);
-  }
-  if (payload.triggered_at) {
-    messageParts.push(`at ${payload.triggered_at}`);
-  }
-
-  return {
-    title,
-    message: messageParts.join(" ") || "Chartink alert triggered"
-  };
-};
-
-const getWebhookText = (payload, source) => {
-  const chartinkAlert = formatChartinkAlert(payload);
-  if (chartinkAlert) {
-    return chartinkAlert;
-  }
-
-  const title = String(payload.title || payload.heading || `${source} alert`).trim();
-  const message = String(
-    payload.message ||
-    payload.content ||
-    payload.alert ||
-    payload.text ||
-    payload.raw ||
-    "New webhook alert received"
-  ).trim();
-
-  return {
-    title: title || "Webhook alert",
-    message: message || "New webhook alert received"
-  };
-};
-
 const notifyAllUsers = async ({ payload, source, eventType, eventId }) => {
   const users = await User.find({
     isVerified: true,
-    isTeamApproved: { $ne: false }
+    isTeamApproved: { $ne: false },
+    intradayStockAlertsEnabled: { $ne: false }
   }).select("_id");
   const recipientIds = users.map((user) => String(user._id));
-  const { title, message } = getWebhookText(payload, source);
+  const { title, message } = buildWebhookNotificationText(payload, source);
 
   const result = await sendPushToUsers({
     recipientIds,
@@ -148,6 +92,24 @@ router.post("/", express.text({ type: "*/*", limit: "1mb" }), async (req, res) =
       headers: sanitizeHeaders(req.headers),
       receivedAt: new Date()
     });
+
+    try {
+      const webhookText = buildWebhookNotificationText(payload, source);
+      await createNotification({
+        type: "WEBHOOK_ALERT",
+        scope: "GLOBAL",
+        teamCode: null,
+        title: webhookText.title,
+        message: webhookText.message,
+        source,
+        eventType,
+        payload,
+        metadata: webhookText.metadata,
+        relatedWebhookEventId: event._id
+      });
+    } catch (storeErr) {
+      console.error("Failed to store webhook notification:", storeErr?.message || storeErr);
+    }
 
     let notification = { attempted: 0, onesignal: null };
     try {

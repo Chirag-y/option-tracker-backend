@@ -60,6 +60,7 @@ app.get("/health", (req, res) => {
 app.use("/api/auth", require("./routes/auth"));
 app.use("/api/trades", require("./routes/trades"));
 app.use("/api/users", require("./routes/users"));
+app.use("/api/notifications", require("./routes/notifications"));
 app.use("/api/calendar", require("./routes/calendar"));
 app.use("/api/charts", require("./routes/charts"));
 app.use("/api/export", require("./routes/export"));

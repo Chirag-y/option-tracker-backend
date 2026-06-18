@@ -7,6 +7,7 @@ const auth = require("../middlewares/auth.middleware");
 const teamStatus = require("../utils/teamStatus");
 const recalculateTeam = require("../utils/recalculateTeam");
 const notifyTeam = require("../utils/notifyTeam");
+const { buildTradeNotificationText, createNotification } = require("../utils/notifications");
 
 router.get("/", auth, async (req, res) => {
   try {
@@ -141,7 +142,8 @@ router.post("/", auth, async (req, res) => {
         (u) =>
           String(u._id) !== String(req.user.id) &&
           u.isVerified &&
-          u.isTeamApproved !== false
+          u.isTeamApproved !== false &&
+          u.tradeResultNotificationsEnabled !== false
       );
       const actor = teamUsers.find((u) => String(u._id) === String(req.user.id));
       await notifyTeam({
@@ -151,6 +153,28 @@ router.post("/", auth, async (req, res) => {
       });
     } catch (notifErr) {
       console.error("Failed to send notification", notifErr?.message || notifErr);
+    }
+
+    try {
+      const actor = teamUsers.find((u) => String(u._id) === String(req.user.id));
+      const tradeText = buildTradeNotificationText(trade, actor?.name || req.user.email);
+      await createNotification({
+        type: "TRADE_RESULT",
+        scope: "TEAM",
+        teamCode: req.user.teamCode,
+        title: tradeText.title,
+        message: tradeText.message,
+        source: "trade",
+        eventType: "trade.created",
+        payload: {
+          trade: trade.toObject ? trade.toObject() : trade
+        },
+        metadata: tradeText.metadata,
+        relatedTradeId: trade._id,
+        createdBy: req.user.id
+      });
+    } catch (storeErr) {
+      console.error("Failed to store trade notification:", storeErr?.message || storeErr);
     }
 
     res.status(201).json(trade);

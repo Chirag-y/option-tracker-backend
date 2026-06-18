@@ -23,7 +23,9 @@ const UserSchema = new mongoose.Schema({
   pnlModeLocked: { type: Boolean, default: false },
   pnlEligibleFrom: { type: Date, default: Date.now },
   currentBalance: { type: Number, default: 0 },
-  onesignalPlayerIds: { type: [String], default: [] }
+  onesignalPlayerIds: { type: [String], default: [] },
+  tradeResultNotificationsEnabled: { type: Boolean, default: true },
+  intradayStockAlertsEnabled: { type: Boolean, default: true }
 }, { timestamps: true });
 
 UserSchema.index({ email: 1, teamCode: 1 }, { unique: true });

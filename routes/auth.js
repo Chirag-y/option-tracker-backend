@@ -99,7 +99,9 @@ router.post("/login", async (req, res) => {
         pnlEligibleFrom: user.pnlEligibleFrom,
         investedAmount: user.investedAmount,
         sharePercentage: user.sharePercentage,
-        currentBalance: user.currentBalance
+        currentBalance: user.currentBalance,
+        tradeResultNotificationsEnabled: user.tradeResultNotificationsEnabled,
+        intradayStockAlertsEnabled: user.intradayStockAlertsEnabled
       }
     });
   } catch (err) {
