@@ -7,7 +7,6 @@ const app = express();
 connectDB();
 
 app.use(cors());
-//test
 app.use("/api/webhooks", require("./routes/webhooks"));
 app.use(express.json());
 
