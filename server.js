@@ -2,11 +2,50 @@ require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const connectDB = require("./config/db");
+const { initializeSession } = require("./services/smartApiSession");
+const { loadScripMaster, connectWebSocket } = require("./services/marketDataFeed");
+const { startScannerEngine } = require("./services/scannerEngine");
+
+const http = require("http");
+const { initSocketServer } = require("./services/socketServer");
 
 const app = express();
+const server = http.createServer(app);
+initSocketServer(server);
 connectDB();
 
+// Initialize Angel One SmartAPI in the background on startup
+async function startAngelOne() {
+  try {
+    if (
+      process.env.SMARTAPI_API_KEY &&
+      process.env.SMARTAPI_API_KEY !== "YOUR_API_KEY" &&
+      process.env.SMARTAPI_CLIENT_CODE !== "YOUR_CLIENT_CODE"
+    ) {
+      console.log("[SmartAPI] Initializing daily API session...");
+      await initializeSession();
+      await loadScripMaster();
+      // Default subscription list
+      await connectWebSocket([
+        "Nifty 50", "Nifty Bank", "SENSEX",
+        "Nifty Auto", "Nifty Fin Service", "Nifty FMCG", "Nifty IT", "Nifty Media",
+        "Nifty Metal", "Nifty Pharma", "Nifty PSU Bank", "Nifty Realty", "Nifty Pvt Bank",
+        "Nifty Infra", "Nifty Energy", "Nifty PSE", "Nifty Serv Sector",
+        "RELIANCE", "HDFCBANK", "SBIN"
+      ]);
+    } else {
+      console.log("[SmartAPI] Running in offline/mock data mode (No credentials set).");
+    }
+    // Always start calculation loop
+    startScannerEngine();
+  } catch (error) {
+    console.error("[SmartAPI] Background startup failed:", error.message);
+  }
+}
+startAngelOne();
+
 app.use(cors());
+
 app.use("/api/webhooks", require("./routes/webhooks"));
 app.use(express.json());
 
@@ -17,7 +56,7 @@ app.get("/", (req, res) => {
       <head>
         <meta charset="utf-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1" />
-        <title>Option Tracker API</title>
+        <title>Trade Screener API</title>
         <style>
           body {
             margin: 0;
@@ -44,7 +83,7 @@ app.get("/", (req, res) => {
       </head>
       <body>
         <main>
-          <h1>Option Tracker API is running</h1>
+          <h1>Trade Screener API is running</h1>
           <p>Backend service is live and ready.</p>
         </main>
       </body>
@@ -57,6 +96,7 @@ app.get("/health", (req, res) => {
 });
 
 app.use("/api/auth", require("./routes/auth"));
+app.use("/api/scanner", require("./routes/scanner"));
 app.use("/api/trades", require("./routes/trades"));
 app.use("/api/users", require("./routes/users"));
 app.use("/api/notifications", require("./routes/notifications"));
@@ -70,6 +110,6 @@ app.use((req, res) => {
 });
 
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () =>
+server.listen(PORT, () =>
   console.log("Server running on port " + PORT)
 );

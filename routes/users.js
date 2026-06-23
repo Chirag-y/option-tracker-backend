@@ -226,6 +226,42 @@ router.patch("/me", auth, async (req, res) => {
   }
 });
 
+router.patch("/me/layout", auth, async (req, res) => {
+  try {
+    const { cockpitCardOrder } = req.body;
+    if (!Array.isArray(cockpitCardOrder)) {
+      return res.status(400).json({ message: "cockpitCardOrder must be an array of strings" });
+    }
+    const user = await User.findOneAndUpdate(
+      { _id: req.user.id, teamCode: req.user.teamCode },
+      { $set: { cockpitCardOrder } },
+      { new: true }
+    ).select("-password");
+    if (!user) return res.status(404).json({ message: "User not found" });
+    res.json(user);
+  } catch (err) {
+    res.status(500).json({ message: "Failed to update layout" });
+  }
+});
+
+router.patch("/me/subscriptions", auth, async (req, res) => {
+  try {
+    const { subscribedScanners } = req.body;
+    if (!Array.isArray(subscribedScanners)) {
+      return res.status(400).json({ message: "subscribedScanners must be an array of strings" });
+    }
+    const user = await User.findOneAndUpdate(
+      { _id: req.user.id, teamCode: req.user.teamCode },
+      { $set: { subscribedScanners } },
+      { new: true }
+    ).select("-password");
+    if (!user) return res.status(404).json({ message: "User not found" });
+    res.json(user);
+  } catch (err) {
+    res.status(500).json({ message: "Failed to update subscriptions" });
+  }
+});
+
 router.patch("/me/password", auth, async (req, res) => {
   try {
     const { currentPassword, newPassword } = req.body;

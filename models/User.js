@@ -25,7 +25,9 @@ const UserSchema = new mongoose.Schema({
   currentBalance: { type: Number, default: 0 },
   onesignalPlayerIds: { type: [String], default: [] },
   tradeResultNotificationsEnabled: { type: Boolean, default: true },
-  intradayStockAlertsEnabled: { type: Boolean, default: true }
+  intradayStockAlertsEnabled: { type: Boolean, default: true },
+  cockpitCardOrder: { type: [String], default: [] },
+  subscribedScanners: { type: [String], default: [] }
 }, { timestamps: true });
 
 UserSchema.index({ email: 1, teamCode: 1 }, { unique: true });
