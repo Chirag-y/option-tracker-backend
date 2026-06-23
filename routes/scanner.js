@@ -8,6 +8,9 @@ router.post("/hull-scan", scannerController.scanStock);
 // Swing Tracker Scanner
 router.post("/swing-tracker-scan", scannerController.scanSwingTracker);
 
+// Commodities route
+router.get("/commodities", scannerController.getCommodities);
+
 // Backtesting endpoint
 router.get("/:id/backtest", scannerController.getBacktest);
 

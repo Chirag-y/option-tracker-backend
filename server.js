@@ -31,15 +31,18 @@ async function startAngelOne() {
         "Nifty Auto", "Nifty Fin Service", "Nifty FMCG", "Nifty IT", "Nifty Media",
         "Nifty Metal", "Nifty Pharma", "Nifty PSU Bank", "Nifty Realty", "Nifty Pvt Bank",
         "Nifty Infra", "Nifty Energy", "Nifty PSE", "Nifty Serv Sector",
-        "RELIANCE", "HDFCBANK", "SBIN"
+        "RELIANCE", "TCS", "INFOSYS", "HDFCBANK", "ICICIBANK", "SBIN",
+        "TATAMOTORS", "ITC", "TATASTEEL", "BHARTIRTEL", "SUNPHARMA",
+        "JINDALSTEL", "MARUTI", "AXISBANK", "WIPRO", "SUZLON", "YESBANK"
       ]);
     } else {
-      console.log("[SmartAPI] Running in offline/mock data mode (No credentials set).");
+      console.log("[SmartAPI] Running without live broker credentials. Real-time scanner updates will be limited.");
     }
-    // Always start calculation loop
-    startScannerEngine();
   } catch (error) {
     console.error("[SmartAPI] Background startup failed:", error.message);
+  } finally {
+    // Always start the scanner engine, even if the live broker bootstrap failed.
+    startScannerEngine();
   }
 }
 startAngelOne();

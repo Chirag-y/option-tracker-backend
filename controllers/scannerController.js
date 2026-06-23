@@ -77,7 +77,7 @@ exports.scanSwingTracker = async (req, res) => {
     });
   }
 };
-const { forceRecalculateScanner, getHistoricalDailyCandles, getStockIndicators, getNseEqUniverse } = require("../services/scannerEngine");
+const { forceRecalculateScanner, getHistoricalDailyCandles, getStockIndicators, getNseEqUniverse, computeStockMetrics, calculateStrengthScore, fetchHistoricalDailyCandles, getSymbolToTokenMap } = require("../services/scannerEngine");
 
 /**
  * Endpoint to trigger manual recalculation of a specific swing scanner.
@@ -86,7 +86,7 @@ const { forceRecalculateScanner, getHistoricalDailyCandles, getStockIndicators, 
 exports.recalculateScanner = async (req, res) => {
   try {
     const { id } = req.params;
-    const allowedScanners = ["swing-tracker", "early-swing-reversal", "swing-trades", "swing-momentum-breakout"];
+    const allowedScanners = ["swing-tracker"];
     if (!allowedScanners.includes(id)) {
       return res.status(400).json({
         success: false,
@@ -123,7 +123,34 @@ exports.getStockDetails = async (req, res) => {
     const stockInfo = universe.find(s => s.symbol === symbol);
 
     const allCandles = getHistoricalDailyCandles() || {};
-    const stockCandles = allCandles[symbol];
+    let stockCandles = allCandles[symbol];
+    const niftyCandles = allCandles["Nifty 50"] || [];
+
+    // If candles are not in local cache, dynamically fetch from SmartAPI
+    if (!stockCandles || stockCandles.length === 0) {
+      console.log(`[ScannerController] Candles not in cache for ${symbol}, attempting dynamic fetch...`);
+      const symbolToTokenMap = getSymbolToTokenMap();
+      const symbolKey = `${symbol}-EQ`;
+      const instrument = symbolToTokenMap[symbolKey] || symbolToTokenMap[symbol];
+
+      if (!instrument) {
+        return res.status(404).json({
+          success: false,
+          message: `No token mapping found for symbol ${symbol}. Please ensure the stock exists on NSE.`
+        });
+      }
+
+      const fetched = await fetchHistoricalDailyCandles(symbol, instrument.token, instrument.segment);
+      if (!fetched) {
+        return res.status(404).json({
+          success: false,
+          message: `Unable to fetch historical candles for ${symbol}. Please try again later.`
+        });
+      }
+
+      // Re-read from cache after fetching
+      stockCandles = getHistoricalDailyCandles()[symbol];
+    }
 
     if (!stockCandles || stockCandles.length === 0) {
       return res.status(404).json({
@@ -148,6 +175,12 @@ exports.getStockDetails = async (req, res) => {
     const high52W = ind.maxHigh || ltp * 1.15;
     const low52W = ind.minLow || ltp * 0.82;
 
+    const metrics = computeStockMetrics(symbol, stockCandles, niftyCandles);
+    let strengthResult = { score: 50, breakdown: { trend: 0, momentum: 0, volume: 0, relativeStrength: 0, breakout: 0, bonus: 0 } };
+    if (metrics) {
+      strengthResult = calculateStrengthScore(metrics);
+    }
+
     return res.json({
       success: true,
       symbol,
@@ -163,6 +196,8 @@ exports.getStockDetails = async (req, res) => {
       deliveryPercent: `${deliveryPercent.toFixed(1)}%`,
       high52W,
       low52W,
+      metrics,
+      strength: strengthResult,
       candles: stockCandles.map(c => ({
         time: c.date,
         open: c.open,
@@ -178,6 +213,43 @@ exports.getStockDetails = async (req, res) => {
         ema50: ind.currentEma50,
         ema200: ind.currentEma200
       }
+    });
+  } catch (err) {
+    return res.status(500).json({
+      success: false,
+      message: err.message
+    });
+  }
+};
+
+const { getCommodityUniverse, getTickCache } = require("../services/marketDataFeed");
+
+/**
+ * Endpoint to fetch live commodity prices from the MCX universe.
+ * Route: GET /api/scanner/commodities
+ */
+exports.getCommodities = async (req, res) => {
+  try {
+    const universe = getCommodityUniverse() || [];
+    const ticks = getTickCache() || {};
+
+    const commoditiesData = universe.map(item => {
+      const tick = ticks[item.symbol] || ticks[item.commodity] || {};
+      return {
+        commodity: item.commodity,
+        symbol: item.symbol,
+        token: item.token,
+        segment: item.segment,
+        expiry: item.expiry,
+        price: tick.price || tick.ltp || null,
+        changePercent: tick.changePercent !== undefined ? tick.changePercent : null,
+        timestamp: tick.timestamp || null
+      };
+    });
+
+    return res.json({
+      success: true,
+      commodities: commoditiesData
     });
   } catch (err) {
     return res.status(500).json({

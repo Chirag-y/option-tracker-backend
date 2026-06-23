@@ -66,46 +66,58 @@ function calculateSwingTracker(candles, options = {}) {
   };
 
   // 4. Keltner-channel-based Modified Supertrend (Buy/Sell Triggers)
+  // Faithfully replicates Pine Script's supertrend() function:
+  // - rangec = upperKeltner - lowerKeltner = 2*(high-low)
+  // - upperBand = close + sensitivity * rangec
+  // - lowerBand = close - sensitivity * rangec
+  // - direction uses prevSuperTrend === prevUpperBand (Pine's nz() default = 0)
   const keltnerSupertrend = () => {
     const superTrendVal = new Array(candles.length).fill(null);
+    const upperBandArr = new Array(candles.length).fill(null);
+    const lowerBandArr = new Array(candles.length).fill(null);
     const direction = new Array(candles.length).fill(null);
-
-    let prevDir = null;
-    let upperBandPrev = null;
-    let lowerBandPrev = null;
 
     for (let i = 0; i < candles.length; i++) {
       const ma = sma(closes, keltnerLength, i);
       if (ma === null) continue;
 
-      const rangec = highs[i] - lows[i];
-      const rangeKeltner = 2 * rangec; // upperKeltner - lowerKeltner
+      // Pine: rangec = upperKeltner - lowerKeltner = 2*(high-low)
+      const rangeKeltner = 2 * (highs[i] - lows[i]);
 
       let upperBand = closes[i] + sensitivity * rangeKeltner;
       let lowerBand = closes[i] - sensitivity * rangeKeltner;
 
-      if (upperBandPrev !== null) {
-        lowerBand = (lowerBand > lowerBandPrev || closes[i - 1] < lowerBandPrev) ? lowerBand : lowerBandPrev;
-        upperBand = (upperBand < upperBandPrev || closes[i - 1] > upperBandPrev) ? upperBand : upperBandPrev;
-      }
+      // Pine: prevLowerBand = nz(lowerBand[1]) = 0 if na
+      const prevLowerBand = (i > 0 && lowerBandArr[i - 1] !== null) ? lowerBandArr[i - 1] : 0;
+      const prevUpperBand = (i > 0 && upperBandArr[i - 1] !== null) ? upperBandArr[i - 1] : 0;
+      const prevClose = i > 0 ? closes[i - 1] : 0;
 
-      let dir = 1;
-      if (prevDir === null) {
+      // Pine := assignment (locking bands)
+      lowerBand = (lowerBand > prevLowerBand || prevClose < prevLowerBand) ? lowerBand : prevLowerBand;
+      upperBand = (upperBand < prevUpperBand || prevClose > prevUpperBand) ? upperBand : prevUpperBand;
+
+      upperBandArr[i] = upperBand;
+      lowerBandArr[i] = lowerBand;
+
+      // Pine: direction based on prevSuperTrend vs prevUpperBand
+      const prevST = i > 0 ? superTrendVal[i - 1] : null;
+      const prevUB = i > 0 ? upperBandArr[i - 1] : null;
+
+      let dir;
+      if (prevST === null) {
+        // First valid bar (na(rangec[1]) in Pine) => default direction 1 (sell mode)
         dir = 1;
-      } else if (prevDir === 1) {
+      } else if (prevST === prevUB) {
+        // Previous was in sell mode (supertrend = upper band above price)
         dir = closes[i] > upperBand ? -1 : 1;
       } else {
+        // Previous was in buy mode (supertrend = lower band below price)
         dir = closes[i] < lowerBand ? 1 : -1;
       }
 
       const currentSuperTrend = dir === -1 ? lowerBand : upperBand;
-
       superTrendVal[i] = currentSuperTrend;
       direction[i] = dir;
-
-      prevDir = dir;
-      upperBandPrev = upperBand;
-      lowerBandPrev = lowerBand;
     }
 
     return { superTrendVal, direction };
@@ -114,31 +126,38 @@ function calculateSwingTracker(candles, options = {}) {
   const { superTrendVal } = keltnerSupertrend();
 
   // 5. Standard Supertrend (Used for candle body colors in chart)
+  // Matches Pine Script's ta.supertrend(factor, atrPeriod)
   const stdST = (() => {
     const atr = calculateATR(atrPeriod);
     const superTrendVal = new Array(candles.length).fill(null);
-
-    let prevDir = null;
-    let upperBandPrev = null;
-    let lowerBandPrev = null;
+    const upperBandArrST = new Array(candles.length).fill(null);
+    const lowerBandArrST = new Array(candles.length).fill(null);
 
     for (let i = 0; i < candles.length; i++) {
-      if (i < atrPeriod - 1) continue;
+      if (atr[i] === null) continue;
 
       const atrVal = atr[i];
       const mid = (highs[i] + lows[i]) / 2;
       let upperBand = mid + factor * atrVal;
       let lowerBand = mid - factor * atrVal;
 
-      if (upperBandPrev !== null) {
-        lowerBand = (lowerBand > lowerBandPrev || closes[i - 1] < lowerBandPrev) ? lowerBand : lowerBandPrev;
-        upperBand = (upperBand < upperBandPrev || closes[i - 1] > upperBandPrev) ? upperBand : upperBandPrev;
-      }
+      const prevLowerBand = (i > 0 && lowerBandArrST[i - 1] !== null) ? lowerBandArrST[i - 1] : 0;
+      const prevUpperBand = (i > 0 && upperBandArrST[i - 1] !== null) ? upperBandArrST[i - 1] : 0;
+      const prevClose = i > 0 ? closes[i - 1] : 0;
 
-      let dir = 1;
-      if (prevDir === null) {
+      lowerBand = (lowerBand > prevLowerBand || prevClose < prevLowerBand) ? lowerBand : prevLowerBand;
+      upperBand = (upperBand < prevUpperBand || prevClose > prevUpperBand) ? upperBand : prevUpperBand;
+
+      upperBandArrST[i] = upperBand;
+      lowerBandArrST[i] = lowerBand;
+
+      const prevST = i > 0 ? superTrendVal[i - 1] : null;
+      const prevUB = i > 0 ? upperBandArrST[i - 1] : null;
+
+      let dir;
+      if (prevST === null) {
         dir = 1;
-      } else if (prevDir === 1) {
+      } else if (prevST === prevUB) {
         dir = closes[i] > upperBand ? -1 : 1;
       } else {
         dir = closes[i] < lowerBand ? 1 : -1;
@@ -146,10 +165,6 @@ function calculateSwingTracker(candles, options = {}) {
 
       const currentSuperTrend = dir === -1 ? lowerBand : upperBand;
       superTrendVal[i] = currentSuperTrend;
-
-      prevDir = dir;
-      upperBandPrev = upperBand;
-      lowerBandPrev = lowerBand;
     }
 
     return { superTrendVal };

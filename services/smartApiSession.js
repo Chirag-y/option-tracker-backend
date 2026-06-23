@@ -1,8 +1,10 @@
+const { generateSync } = require("otplib");
 const { SmartAPI } = require("smartapi-javascript");
-const otplib = require("otplib");
 
 let sessionData = null;
 let smartApiInstance = null;
+let refreshInFlight = null;
+const sessionRefreshListeners = new Set();
 
 /**
  * Programmatically generates the 2FA TOTP token from the secret key.
@@ -14,7 +16,28 @@ function generateTotp() {
   }
   // Remove spaces or hyphens if any
   const cleanedSecret = secret.replace(/\s+/g, "").toUpperCase();
-  return otplib.generateSync({ secret: cleanedSecret });
+  return generateSync({ secret: cleanedSecret });
+}
+
+function attachSessionExpiryHook(api) {
+  if (!api || typeof api.setSessionExpiryHook !== "function") return;
+
+  api.setSessionExpiryHook(() => {
+    refreshSession("session-expired").catch((error) => {
+      console.error("[SmartAPI] Automatic session refresh failed:", error.message);
+    });
+  });
+}
+
+async function notifySessionRefreshListeners(session) {
+  const listeners = Array.from(sessionRefreshListeners);
+  for (const listener of listeners) {
+    try {
+      await listener(session);
+    } catch (error) {
+      console.error("[SmartAPI] Session refresh listener failed:", error.message);
+    }
+  }
 }
 
 /**
@@ -37,6 +60,7 @@ async function initializeSession() {
     const api = new SmartAPI({
       api_key: apiKey,
     });
+    attachSessionExpiryHook(api);
 
     const response = await api.generateSession(clientCode, password, totpToken);
 
@@ -49,6 +73,7 @@ async function initializeSession() {
       };
       smartApiInstance = api;
       console.log("[SmartAPI] Session successfully initialized!");
+      await notifySessionRefreshListeners(sessionData);
       return sessionData;
     } else {
       throw new Error(response.message || "Failed to generate session - Invalid response structure.");
@@ -85,11 +110,38 @@ function setSessionManually(session) {
   smartApiInstance = new SmartAPI({
     api_key: process.env.SMARTAPI_API_KEY,
   });
+  attachSessionExpiryHook(smartApiInstance);
+}
+
+async function refreshSession(reason = "manual") {
+  if (refreshInFlight) {
+    return refreshInFlight;
+  }
+
+  refreshInFlight = (async () => {
+    console.log(`[SmartAPI] Refreshing session (${reason})...`);
+    return initializeSession();
+  })();
+
+  try {
+    return await refreshInFlight;
+  } finally {
+    refreshInFlight = null;
+  }
+}
+
+function registerSessionRefreshListener(listener) {
+  sessionRefreshListeners.add(listener);
+  return () => {
+    sessionRefreshListeners.delete(listener);
+  };
 }
 
 module.exports = {
   initializeSession,
+  refreshSession,
   getSession,
   getSmartApiInstance,
-  setSessionManually
+  setSessionManually,
+  registerSessionRefreshListener
 };

@@ -66,7 +66,7 @@ async function runBacktest(scannerId, periodDays = 60) {
     let threeMin = indexData["THREE_MINUTE"] || [];
 
     const unifiedCandles = buildUnifiedIndexCandles(oneMin, threeMin);
-    const trades = generateIndexTrades(unifiedCandles, targetPoints, slPoints, symbol);
+    const trades = await generateIndexTrades(unifiedCandles, targetPoints, slPoints, symbol);
 
     const mappedTrades = trades.map((t, idx) => {
       let targetPrice = t.targetPrice;
@@ -95,14 +95,12 @@ async function runBacktest(scannerId, periodDays = 60) {
         status: t.status,
         signalStrength: t.signalStrength || "STRONG",
         direction: t.direction,
-        optionName: t.optionName || "—",
-        optionEntryPrice: t.optionEntryPrice,
-        optionExitPrice: t.optionExitPrice,
-        optionCurrentPrice: t.optionCurrentPrice,
         isRisky: t.isRisky === true,
+        targetReached: t.targetReached === true,
+        trailingActive: t.trailingActive === true,
+        trailingStopPrice: t.trailingStopPrice ?? null,
         reason: t.type ? t.type.replace('EXIT (', '').replace(')', '') : undefined,
-        timeframe: t.timeframe || "3M",
-        strike: t.strike
+        timeframe: t.timeframe || "3M"
       };
     });
 
@@ -112,17 +110,9 @@ async function runBacktest(scannerId, periodDays = 60) {
 
     const { getTickCache } = require("./marketDataFeed");
     const ticks = getTickCache() || {};
-    let latestPrice = unifiedCandles.length > 0 ? unifiedCandles[unifiedCandles.length - 1].close : 24000;
-    
-    // Check if we have a live tick cache price
-    if (ticks[indexName] && ticks[indexName].ltp) {
-      latestPrice = ticks[indexName].ltp;
-    } else {
-      // For 19 Jun close prices specifically (non-mocked):
-      if (indexName === "Nifty 50") latestPrice = 24013.10;
-      else if (indexName === "Nifty Bank") latestPrice = 51661.45;
-      else if (indexName === "SENSEX") latestPrice = 77209.90;
-    }
+    const latestPrice = ticks[indexName] && ticks[indexName].ltp
+      ? ticks[indexName].ltp
+      : (unifiedCandles.length > 0 ? unifiedCandles[unifiedCandles.length - 1].close : 0);
 
     return {
       stats: {
@@ -166,7 +156,7 @@ async function runBacktest(scannerId, periodDays = 60) {
   let totalProfitPct = 0;
 
   const now = Date.now();
-  const isSwingScanner = ["swing-tracker", "early-swing-reversal", "swing-trades", "swing-momentum-breakout"].includes(scannerId);
+  const isSwingScanner = scannerId === "swing-tracker";
   
   let cachedDailyCandles = null;
   if (isSwingScanner) {
@@ -352,255 +342,22 @@ async function runBacktest(scannerId, periodDays = 60) {
           }
         }
       });
-    } else {
-      // Other swing scanners use the old step-by-step logic
-      targetTestStocks.forEach(stock => {
-        const allStockCandles = cachedDailyCandles[stock.symbol];
-        if (!allStockCandles || allStockCandles.length < 15) return;
-
-        const startIdx = Math.max(15, allStockCandles.length - periodDays);
-        const endIdx = allStockCandles.length - 1;
-
-        for (let i = startIdx; i <= endIdx; i++) {
-          const subSeries = allStockCandles.slice(0, i + 1);
-          const currentCandle = subSeries[subSeries.length - 1];
-          
-          let triggered = false;
-          let type = "CALL";
-
-          const ind = getStockIndicators(subSeries);
-          const rsiVal = ind.currentRsi;
-          const volumeRatio = (currentCandle.volume || 100000) / ind.avgVol10;
-
-          if (scannerId === "early-swing-reversal") {
-            const ema9_5days = ind.ema9[ind.ema9.length - 6] || ind.ema9[0];
-            const ema21_5days = ind.ema21[ind.ema21.length - 6] || ind.ema21[0];
-            triggered = ind.currentEma9 > ind.currentEma21 && ema9_5days <= ema21_5days && rsiVal > 55 && currentCandle.close > ind.currentEma9 && volumeRatio > 1.0;
-            type = "CALL";
-          } else if (scannerId === "swing-trades" || scannerId === "swing-momentum-breakout") {
-            triggered = rsiVal > 60 && volumeRatio > 1.2;
-            type = "CALL";
-          }
-
-          if (triggered) {
-            const entryPrice = currentCandle.close;
-            const currentDate = currentCandle.date;
-            const targetPercent = 3.0; // 3% profit target
-            const stopPercent = 2.0;   // 2% stop loss
-
-            let exitPrice = entryPrice;
-            let exitDate = currentDate;
-            let pnlPct = 0;
-            let success = false;
-            let closed = false;
-
-            const latestCandle = allStockCandles[allStockCandles.length - 1];
-            const currentPrice = latestCandle.close;
-
-            // Other Swing Scanners: 5-day limit exit check
-            for (let holdIdx = 1; holdIdx <= 5; holdIdx++) {
-              const futureBarIdx = i + holdIdx;
-              if (futureBarIdx >= allStockCandles.length) break;
-
-              const futureBar = allStockCandles[futureBarIdx];
-              const highPct = ((futureBar.high - entryPrice) / entryPrice) * 100;
-              const lowPct = ((futureBar.low - entryPrice) / entryPrice) * 100;
-
-              if (type === "CALL") {
-                if (highPct >= targetPercent) {
-                  exitPrice = entryPrice * (1 + targetPercent / 100);
-                  exitDate = futureBar.date;
-                  pnlPct = targetPercent;
-                  success = true;
-                  closed = true;
-                  break;
-                } else if (lowPct <= -stopPercent) {
-                  exitPrice = entryPrice * (1 - stopPercent / 100);
-                  exitDate = futureBar.date;
-                  pnlPct = -stopPercent;
-                  success = false;
-                  closed = true;
-                  break;
-                }
-              } else {
-                if (lowPct <= -targetPercent) {
-                  exitPrice = entryPrice * (1 - targetPercent / 100);
-                  exitDate = futureBar.date;
-                  pnlPct = targetPercent;
-                  success = true;
-                  closed = true;
-                  break;
-                } else if (highPct >= stopPercent) {
-                  exitPrice = entryPrice * (1 + stopPercent / 100);
-                  exitDate = futureBar.date;
-                  pnlPct = -stopPercent;
-                  success = false;
-                  closed = true;
-                  break;
-                }
-              }
-            }
-
-            if (!closed) {
-              const fifthDayIdx = Math.min(i + 5, allStockCandles.length - 1);
-              const fifthBar = allStockCandles[fifthDayIdx];
-              exitPrice = fifthBar.close;
-              exitDate = fifthBar.date;
-              pnlPct = type === "CALL" 
-                ? ((exitPrice - entryPrice) / entryPrice) * 100 
-                : ((entryPrice - exitPrice) / entryPrice) * 100;
-              success = pnlPct > 0;
-              closed = true;
-            }
-
-            if (closed) {
-              totalTrades++;
-              if (success) winningTrades++;
-              else losingTrades++;
-              totalProfitPct += pnlPct;
-            }
-
-            const targetPrice = entryPrice * (type === "CALL" ? (1 + targetPercent / 100) : (1 - targetPercent / 100));
-            const stopLossPrice = entryPrice * (type === "CALL" ? (1 - stopPercent / 100) : (1 + stopPercent / 100));
-            const pnlAmt = closed
-              ? (type === "CALL" ? (exitPrice - entryPrice) : (entryPrice - exitPrice))
-              : (type === "CALL" ? (currentPrice - entryPrice) : (entryPrice - currentPrice));
-
-            trades.push({
-              id: `t_${i}_${stock.symbol}`,
-              symbol: stock.symbol,
-              name: stock.name,
-              type,
-              entryDate: currentDate,
-              entryPrice: Number(entryPrice.toFixed(2)),
-              exitDate,
-              exitPrice: exitPrice ? Number(exitPrice.toFixed(2)) : null,
-              targetPrice: Number(targetPrice.toFixed(2)),
-              stopLossPrice: Number(stopLossPrice.toFixed(2)),
-              pnlAmount: Number(pnlAmt.toFixed(2)),
-              pnlPct: Number(pnlPct.toFixed(2)),
-              status: closed ? (success ? "PROFIT" : "LOSS") : "OPEN"
-            });
-          }
-        }
-      });
     }
   } else {
-    // Fallback to generating mock history and trade triggers (e.g. for intraday scanners)
-    const stockHistory = {};
-    testStocks.forEach(s => {
-      stockHistory[s.symbol] = generateStockHistory(s.basePrice, periodDays);
-    });
-
-    for (let dayIdx = 20; dayIdx < periodDays - 5; dayIdx++) {
-      const currentDate = new Date(now - (periodDays - dayIdx) * 24 * 60 * 60 * 1000).toISOString().split("T")[0];
-
-      testStocks.forEach(stock => {
-        const candles = stockHistory[stock.symbol].slice(0, dayIdx + 1);
-        if (candles.length < 15) return;
-
-        const currentBar = candles[candles.length - 1];
-        const seed = (stock.symbol.charCodeAt(0) + dayIdx) % 100;
-
-        let triggered = false;
-        let type = "CALL";
-
-        if (scannerId.includes("bullish") || scannerId.includes("high") || scannerId.includes("gainers") || scannerId.includes("breakout")) {
-          triggered = seed < 6;
-          type = "CALL";
-        } else if (scannerId.includes("bearish") || scannerId.includes("low") || scannerId.includes("losers") || scannerId.includes("weakness")) {
-          triggered = seed < 6;
-          type = "PUT";
-        } else {
-          triggered = seed < 7;
-          type = "CALL";
-        }
-
-        if (triggered) {
-          const entryPrice = currentBar.close;
-          const targetPercent = 3.0;
-          const stopPercent = 2.0;
-
-          let exitPrice = entryPrice;
-          let exitDate = currentDate;
-          let pnlPct = 0;
-          let success = false;
-          let closed = false;
-
-          for (let holdIdx = 1; holdIdx <= 5; holdIdx++) {
-            const futureBarIdx = dayIdx + holdIdx;
-            if (futureBarIdx >= periodDays) break;
-
-            const futureBar = stockHistory[stock.symbol][futureBarIdx];
-            const highPct = ((futureBar.high - entryPrice) / entryPrice) * 100;
-            const lowPct = ((futureBar.low - entryPrice) / entryPrice) * 100;
-
-            if (type === "CALL") {
-              if (highPct >= targetPercent) {
-                exitPrice = entryPrice * (1 + targetPercent / 100);
-                exitDate = new Date(now - (periodDays - futureBarIdx) * 24 * 60 * 60 * 1000).toISOString().split("T")[0];
-                pnlPct = targetPercent;
-                success = true;
-                closed = true;
-                break;
-              } else if (lowPct <= -stopPercent) {
-                exitPrice = entryPrice * (1 - stopPercent / 100);
-                exitDate = new Date(now - (periodDays - futureBarIdx) * 24 * 60 * 60 * 1000).toISOString().split("T")[0];
-                pnlPct = -stopPercent;
-                success = false;
-                closed = true;
-                break;
-              }
-            } else {
-              if (lowPct <= -targetPercent) {
-                exitPrice = entryPrice * (1 - targetPercent / 100);
-                exitDate = new Date(now - (periodDays - futureBarIdx) * 24 * 60 * 60 * 1000).toISOString().split("T")[0];
-                pnlPct = targetPercent;
-                success = true;
-                closed = true;
-                break;
-              } else if (highPct >= stopPercent) {
-                exitPrice = entryPrice * (1 + stopPercent / 100);
-                exitDate = new Date(now - (periodDays - futureBarIdx) * 24 * 60 * 60 * 1000).toISOString().split("T")[0];
-                pnlPct = -stopPercent;
-                success = false;
-                closed = true;
-                break;
-              }
-            }
-          }
-
-          if (!closed) {
-            const fifthDayIdx = Math.min(dayIdx + 5, periodDays - 1);
-            const fifthBar = stockHistory[stock.symbol][fifthDayIdx];
-            exitPrice = fifthBar.close;
-            exitDate = new Date(now - (periodDays - fifthDayIdx) * 24 * 60 * 60 * 1000).toISOString().split("T")[0];
-            pnlPct = type === "CALL" 
-              ? ((exitPrice - entryPrice) / entryPrice) * 100 
-              : ((entryPrice - exitPrice) / entryPrice) * 100;
-            success = pnlPct > 0;
-          }
-
-          totalTrades++;
-          if (success) winningTrades++;
-          else losingTrades++;
-          totalProfitPct += pnlPct;
-
-          trades.push({
-            id: `t_${dayIdx}_${stock.symbol}`,
-            symbol: stock.symbol,
-            name: stock.name,
-            type,
-            entryDate: currentDate,
-            entryPrice: Number(entryPrice.toFixed(2)),
-            exitDate,
-            exitPrice: Number(exitPrice.toFixed(2)),
-            pnlPct: Number(pnlPct.toFixed(2)),
-            status: success ? "PROFIT" : "LOSS"
-          });
-        }
-      });
-    }
+    return {
+      scannerId,
+      periodDays,
+      stats: {
+        totalTrades: 0,
+        winningTrades: 0,
+        losingTrades: 0,
+        winRate: 0,
+        averageProfitPct: 0,
+        netProfitPct: 0
+      },
+      equityCurve: [],
+      trades: []
+    };
   }
 
   // Sort trades by entryDate descending
@@ -649,32 +406,6 @@ async function runBacktest(scannerId, periodDays = 60) {
     equityCurve,
     trades: trades
   };
-}
-
-/**
- * Helper to generate mock historical daily bars.
- */
-function generateStockHistory(basePrice, days) {
-  const bars = [];
-  let price = basePrice * 0.85;
-  const now = Date.now();
-  for (let i = days; i >= 0; i--) {
-    const change = (Math.random() - 0.47) * (price * 0.02);
-    const open = price;
-    const close = price + change;
-    const high = Math.max(open, close) + Math.random() * (price * 0.006);
-    const low = Math.min(open, close) - Math.random() * (price * 0.006);
-    price = close;
-
-    bars.push({
-      high,
-      low,
-      open,
-      close,
-      volume: 100000 + Math.floor(Math.random() * 500000)
-    });
-  }
-  return bars;
 }
 
 module.exports = {
