@@ -101,7 +101,8 @@ router.post("/login", async (req, res) => {
         sharePercentage: user.sharePercentage,
         currentBalance: user.currentBalance,
         tradeResultNotificationsEnabled: user.tradeResultNotificationsEnabled,
-        intradayStockAlertsEnabled: user.intradayStockAlertsEnabled
+        intradayStockAlertsEnabled: user.intradayStockAlertsEnabled,
+        cockpitCardOrder: user.cockpitCardOrder || []
       }
     });
   } catch (err) {
@@ -123,6 +124,39 @@ router.get("/me", auth, async (req, res) => {
     });
   } catch (err) {
     res.status(500).json({ message: "Failed to load profile" });
+  }
+});
+
+router.get("/angelone/callback", async (req, res) => {
+  try {
+    const { auth_token, feed_token, refresh_token, client_code } = req.query;
+
+    if (!auth_token || !feed_token) {
+      return res.status(400).send("<h1>Authentication failed: Missing tokens from Angel One redirect.</h1>");
+    }
+
+    console.log(`[SmartAPI Callback] Received session redirect for client: ${client_code}`);
+    
+    // Update the in-memory session data
+    const { setSessionManually } = require("../services/smartApiSession");
+    setSessionManually({
+      jwtToken: auth_token,
+      refreshToken: refresh_token || "",
+      feedToken: feed_token,
+      clientCode: client_code || "USER"
+    });
+
+    // Refresh instruments list and initialize the WebSocket connection
+    const { loadScripMaster, connectWebSocket } = require("../services/marketDataFeed");
+    await loadScripMaster();
+    await connectWebSocket(["Nifty 50", "RELIANCE", "HDFCBANK", "SBIN"]);
+
+    // Redirect user's browser back to the frontend dashboard
+    const frontendUrl = process.env.FRONTEND_URL || "http://localhost:3001";
+    return res.redirect(`${frontendUrl}?connected=true`);
+  } catch (err) {
+    console.error("[SmartAPI Callback] Error saving OAuth redirect session:", err.message);
+    return res.status(500).send(`<h1>Authentication Error</h1><p>${err.message}</p>`);
   }
 });
 

@@ -1,6 +1,6 @@
 const { sendPushToUsers } = require("./onesignal");
 
-module.exports = async ({ recipientIds, trade, sender }) => {
+module.exports = async ({ recipientIds, trade, sender, notificationId }) => {
   try {
     return await sendPushToUsers({
       recipientIds,
@@ -10,7 +10,10 @@ module.exports = async ({ recipientIds, trade, sender }) => {
         en: `${trade.instrument} ${trade.resultType} - Rs ${Math.abs(trade.finalAmount).toFixed(2)}`
       },
       data: {
-        type: "trade_created",
+        // Canonical mobile-side type — matches the in-app feed value so the RN
+        // client's shouldSuppress() and dedup logic can key off a stable string.
+        type: "TRADE_RESULT",
+        notificationId: notificationId || null,
         tradeId: String(trade._id),
         teamCode: trade.teamCode
       }

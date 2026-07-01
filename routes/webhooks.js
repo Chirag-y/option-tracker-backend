@@ -35,7 +35,7 @@ const sanitizeHeaders = (headers) => ({
   "x-real-ip": headers["x-real-ip"]
 });
 
-const notifyAllUsers = async ({ payload, source, eventType, eventId }) => {
+const notifyAllUsers = async ({ payload, source, eventType, eventId, notificationId }) => {
   const users = await User.find({
     isVerified: true,
     isTeamApproved: { $ne: false },
@@ -50,7 +50,13 @@ const notifyAllUsers = async ({ payload, source, eventType, eventId }) => {
     headings: { en: title },
     contents: { en: message },
     data: {
-      type: "webhook_alert",
+      // Canonical mobile-side type — matches the in-app feed value so the RN
+      // client's shouldSuppress() and dedup logic can key off a stable string.
+      type: "WEBHOOK_ALERT",
+      // The persisted Notification _id — used by the mobile client as the
+      // dedup key so the OS can't re-display already-shown alerts when the
+      // app foregrounds.
+      notificationId: notificationId || null,
       webhookEventId: String(eventId),
       source,
       eventType
@@ -95,7 +101,7 @@ router.post("/", express.text({ type: "*/*", limit: "1mb" }), async (req, res) =
 
     try {
       const webhookText = buildWebhookNotificationText(payload, source);
-      await createNotification({
+      const storedNotification = await createNotification({
         type: "WEBHOOK_ALERT",
         scope: "GLOBAL",
         teamCode: null,
@@ -107,6 +113,9 @@ router.post("/", express.text({ type: "*/*", limit: "1mb" }), async (req, res) =
         metadata: webhookText.metadata,
         relatedWebhookEventId: event._id
       });
+      // Stash the persisted notification id on the request so the OneSignal
+      // payload can include it (mobile dedup keys off this).
+      req._storedNotificationId = storedNotification?._id ? String(storedNotification._id) : null;
     } catch (storeErr) {
       console.error("Failed to store webhook notification:", storeErr?.message || storeErr);
     }
@@ -117,7 +126,8 @@ router.post("/", express.text({ type: "*/*", limit: "1mb" }), async (req, res) =
         payload,
         source,
         eventType,
-        eventId: event._id
+        eventId: event._id,
+        notificationId: req._storedNotificationId
       });
     } catch (notifErr) {
       console.error("Webhook notification failed:", notifErr?.response?.data || notifErr?.message || notifErr);

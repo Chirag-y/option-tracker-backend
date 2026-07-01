@@ -146,35 +146,39 @@ router.post("/", auth, async (req, res) => {
           u.tradeResultNotificationsEnabled !== false
       );
       const actor = teamUsers.find((u) => String(u._id) === String(req.user.id));
+      // Persist the in-app notification FIRST so the push payload can carry
+      // its id (mobile dedup uses notificationId).
+      let storedNotificationId = null;
+      try {
+        const tradeText = buildTradeNotificationText(trade, actor?.name || req.user.email);
+        const stored = await createNotification({
+          type: "TRADE_RESULT",
+          scope: "TEAM",
+          teamCode: req.user.teamCode,
+          title: tradeText.title,
+          message: tradeText.message,
+          source: "trade",
+          eventType: "trade.created",
+          payload: {
+            trade: trade.toObject ? trade.toObject() : trade
+          },
+          metadata: tradeText.metadata,
+          relatedTradeId: trade._id,
+          createdBy: req.user.id
+        });
+        storedNotificationId = stored?._id ? String(stored._id) : null;
+      } catch (storeErr) {
+        console.error("Failed to store trade notification:", storeErr?.message || storeErr);
+      }
+
       await notifyTeam({
         recipientIds: recipients.map((u) => String(u._id)),
         trade,
-        sender: actor?.name || req.user.email
+        sender: actor?.name || req.user.email,
+        notificationId: storedNotificationId
       });
     } catch (notifErr) {
       console.error("Failed to send notification", notifErr?.message || notifErr);
-    }
-
-    try {
-      const actor = teamUsers.find((u) => String(u._id) === String(req.user.id));
-      const tradeText = buildTradeNotificationText(trade, actor?.name || req.user.email);
-      await createNotification({
-        type: "TRADE_RESULT",
-        scope: "TEAM",
-        teamCode: req.user.teamCode,
-        title: tradeText.title,
-        message: tradeText.message,
-        source: "trade",
-        eventType: "trade.created",
-        payload: {
-          trade: trade.toObject ? trade.toObject() : trade
-        },
-        metadata: tradeText.metadata,
-        relatedTradeId: trade._id,
-        createdBy: req.user.id
-      });
-    } catch (storeErr) {
-      console.error("Failed to store trade notification:", storeErr?.message || storeErr);
     }
 
     res.status(201).json(trade);
