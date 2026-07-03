@@ -262,11 +262,32 @@ router.patch("/me/subscriptions", auth, async (req, res) => {
   }
 });
 
+router.patch("/me/custom-options", auth, async (req, res) => {
+  try {
+    const user = await User.findOne({ _id: req.user.id, teamCode: req.user.teamCode });
+    if (!user) return res.status(404).json({ message: "User not found" });
+
+    if (req.body.customOptionsCallStrike !== undefined) {
+      user.customOptionsCallStrike = req.body.customOptionsCallStrike;
+    }
+    if (req.body.customOptionsPutStrike !== undefined) {
+      user.customOptionsPutStrike = req.body.customOptionsPutStrike;
+    }
+    if (typeof req.body.customOptionsAlertsEnabled === "boolean") {
+      user.customOptionsAlertsEnabled = req.body.customOptionsAlertsEnabled;
+    }
+    await user.save();
+    res.json(user);
+  } catch (err) {
+    res.status(500).json({ message: "Failed to update custom options strikes" });
+  }
+});
+
 router.patch("/me/password", auth, async (req, res) => {
   try {
     const { currentPassword, newPassword } = req.body;
-    if (!currentPassword || !newPassword) {
-      return res.status(400).json({ message: "currentPassword and newPassword are required" });
+    if (!newPassword) {
+      return res.status(400).json({ message: "newPassword is required" });
     }
     if (String(newPassword).length < 6) {
       return res.status(400).json({ message: "New password must be at least 6 characters" });
@@ -274,12 +295,19 @@ router.patch("/me/password", auth, async (req, res) => {
 
     const user = await User.findOne({ _id: req.user.id, teamCode: req.user.teamCode });
     if (!user) return res.status(404).json({ message: "User not found" });
-    const ok = await bcrypt.compare(currentPassword, user.password);
-    if (!ok) return res.status(401).json({ message: "Current password is incorrect" });
+
+    if (!user.mustChangePassword) {
+      if (!currentPassword) {
+        return res.status(400).json({ message: "currentPassword is required" });
+      }
+      const ok = await bcrypt.compare(currentPassword, user.password);
+      if (!ok) return res.status(401).json({ message: "Current password is incorrect" });
+    }
 
     user.password = await bcrypt.hash(newPassword, 10);
+    user.mustChangePassword = false;
     await user.save();
-    res.json({ message: "Password updated successfully" });
+    res.json({ message: "Password updated successfully", mustChangePassword: false });
   } catch (err) {
     res.status(500).json({ message: "Failed to update password" });
   }

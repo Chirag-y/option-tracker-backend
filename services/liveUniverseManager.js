@@ -85,8 +85,16 @@ async function buildUniverse() {
   const fo        = await getActiveFoUniverse();
   // 2. Swing (last 3 trading days)
   const swing     = await getRecentSwingSymbols(3);
-  // 3. Commodities
-  const commodity = await getActiveCommodityUniverse();
+  // 3. Commodities (optional — can be paused from Commodities UI)
+  let commodity = [];
+  try {
+    const { isCommodityFeedPaused } = require("./commodityFeedControl");
+    if (!isCommodityFeedPaused()) {
+      commodity = await getActiveCommodityUniverse();
+    }
+  } catch {
+    commodity = await getActiveCommodityUniverse();
+  }
   // 4. Indices (static)
 
   addAll(INDICES,   "index");
@@ -132,8 +140,12 @@ async function refreshNow({ skipSync = false } = {}) {
       // Best-effort syncs — never block reconciliation.
       try { await syncFoUniverse({ symbolToTokenMap: _deps.symbolToTokenMap }); }
       catch (e) { console.error("[LiveUniverseManager] FO sync err:", e.message); }
-      try { await syncCommodityContracts({ symbolToTokenMap: _deps.symbolToTokenMap }); }
-      catch (e) { console.error("[LiveUniverseManager] Commodity sync err:", e.message); }
+      try {
+        const { isCommodityFeedPaused } = require("./commodityFeedControl");
+        if (!isCommodityFeedPaused()) {
+          await syncCommodityContracts({ symbolToTokenMap: _deps.symbolToTokenMap });
+        }
+      } catch (e) { console.error("[LiveUniverseManager] Commodity sync err:", e.message); }
       try { await purgeOlderThan(30); } catch (e) { /* non-fatal */ void e; }
     }
 

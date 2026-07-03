@@ -10,11 +10,12 @@ const NotificationSchema = new mongoose.Schema(
     },
     scope: {
       type: String,
-      enum: ["GLOBAL", "TEAM"],
+      enum: ["GLOBAL", "TEAM", "USER"],
       required: true,
       index: true
     },
     teamCode: { type: String, default: null, trim: true, index: true },
+    recipientUserId: { type: mongoose.Schema.Types.ObjectId, ref: "User", default: null, index: true },
     title: { type: String, required: true, trim: true },
     message: { type: String, required: true, trim: true },
     source: { type: String, default: "system", trim: true, index: true },

@@ -21,6 +21,28 @@ function istStartOfDay(date = new Date()) {
   return new Date(utcMidnight.getTime() - 5.5 * 60 * 60 * 1000);
 }
 
+/** Parse trigger date from signal fields — handles ISO dates, YYYY-MM-DD, and rejects time-only strings. */
+function resolveTriggerDate(signal) {
+  const candidates = [signal.triggerDate, signal.triggerTime, signal.timestamp];
+  for (const raw of candidates) {
+    if (raw == null || raw === "") continue;
+
+    if (typeof raw === "string") {
+      // YYYY-MM-DD from swing tracker daily candles
+      if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
+        const d = new Date(`${raw}T00:00:00+05:30`);
+        if (!Number.isNaN(d.getTime())) return istStartOfDay(d);
+      }
+      // Time-only strings like "11:46:30 am" cannot be stored — skip
+      if (!raw.includes("-") && !raw.includes("/") && !raw.includes("T")) continue;
+    }
+
+    const d = raw instanceof Date ? raw : new Date(raw);
+    if (!Number.isNaN(d.getTime())) return istStartOfDay(d);
+  }
+  return istStartOfDay();
+}
+
 /** Walk back `days` *trading* days (skip Sat/Sun). Good enough for live ops; holidays handled by query window. */
 function tradingDaysAgo(days) {
   const out = istStartOfDay();
@@ -36,7 +58,7 @@ function tradingDaysAgo(days) {
 async function recordSwingSignal(signal) {
   if (!signal || !signal.symbol) return null;
 
-  const triggerDate = istStartOfDay();
+  const triggerDate = resolveTriggerDate(signal);
   const scannerId   = signal.scannerId || "swing-tracker";
 
   try {

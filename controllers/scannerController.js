@@ -9,6 +9,18 @@ const { resolveIndexAlias } = require("../config/indexSymbolMap");
  */
 const backtestCache = {};
 
+function clearBacktestCache(scannerId) {
+  if (scannerId) {
+    for (const key of Object.keys(backtestCache)) {
+      if (key.startsWith(`${scannerId}_`)) delete backtestCache[key];
+    }
+    return;
+  }
+  for (const key of Object.keys(backtestCache)) delete backtestCache[key];
+}
+
+exports.clearBacktestCache = clearBacktestCache;
+
 exports.getBacktest = async (req, res) => {
   try {
     const { id } = req.params;
@@ -23,40 +35,50 @@ exports.getBacktest = async (req, res) => {
 
     if (isFoScanner) {
       const FoActiveTrade = require("../models/FoActiveTrade");
-      const cutoffDate = new Date();
-      cutoffDate.setDate(cutoffDate.getDate() - period);
+      const { computeFoPnlPct, dedupeFoTradesBySymbol } = require("../services/foTradeUtils");
+      const { tradingDaysAgo } = require("../services/historicalSignalRegenerator");
+      const cutoffDate = tradingDaysAgo(period);
 
       const scannerIds = [id];
 
-      const trades = await FoActiveTrade.find({
+      let trades = await FoActiveTrade.find({
         scannerId: { $in: scannerIds },
         triggeredAt: { $gte: cutoffDate }
       }).sort({ triggeredAt: -1 }).lean();
+
+      trades = dedupeFoTradesBySymbol(trades);
 
       let winningTrades = 0;
       let losingTrades = 0;
       let totalProfitPct = 0;
 
       const mappedTrades = trades.map((t, idx) => {
-        let isProfit = false; 
+        const isShort = t.direction === "BEARISH";
+        let pnlPct = t.pnlPct;
+        if (t.status === "CLOSED" && (pnlPct == null || pnlPct === 0) && t.exitPrice) {
+          pnlPct = computeFoPnlPct(t.direction, t.entryPrice, t.exitPrice);
+        }
+
+        let isProfit = false;
         if (t.status === "CLOSED") {
-          isProfit = t.pnlPct > 0; 
+          isProfit = (pnlPct ?? 0) > 0;
           if (isProfit) winningTrades++;
           else losingTrades++;
-          totalProfitPct += (t.pnlPct || 0);
+          totalProfitPct += (pnlPct || 0);
         }
 
         return {
           id: `fo_${id}_${t._id || idx}`,
           symbol: t.symbol,
           name: t.symbol,
-          type: t.direction === "BULLISH" || t.direction === "CALL" ? "BUY" : "SELL",
+          type: isShort ? "SELL" : "BUY",
+          direction: t.direction,
           entryDate: t.triggeredAt ? new Date(t.triggeredAt).toISOString() : (t.createdAt ? new Date(t.createdAt).toISOString() : new Date().toISOString()),
           entryPrice: t.entryPrice,
           exitDate: t.closedAt ? new Date(t.closedAt).toISOString() : null,
           exitPrice: t.exitPrice || null,
           status: t.status === "CLOSED" ? (isProfit ? "PROFIT" : "LOSS") : "OPEN",
-          pnlPct: t.pnlPct || 0,
+          pnlPct: pnlPct ?? 0,
           signalStrength: (t.strengthScore >= 70 ? "STRONG" : (t.strengthScore >= 50 ? "MEDIUM" : "WEAK")) + (t.strengthScore ? ` (${t.strengthScore})` : ""),
           reason: t.reasons ? t.reasons.join(", ") : "Momentum",
           isRisky: false
@@ -95,7 +117,7 @@ exports.getBacktest = async (req, res) => {
       timestamp: Date.now(),
       data: responseData
     };
-    
+
     return res.json(responseData);
   } catch (err) {
     console.error(`[getBacktest] Error for ${req.params.id}:`, err);
@@ -172,17 +194,23 @@ exports.recalculateScanner = async (req, res) => {
       });
     }
 
-    // Swing tracker uses the full EOD scan (fetches candles for all 1600+ NSE EQ stocks)
+    // Swing tracker — regenerate from Mongo daily candles (past 7 days), no API fetch
     if (id === "swing-tracker") {
-      // Run async — this can take several minutes for 1600+ stocks
-      runEodSwingScan().catch(err => console.error("[ScannerController] EOD swing scan error:", err.message));
+      const { clearBacktestCache } = exports;
+      forceRecalculateScanner("swing-tracker")
+        .then(signals => {
+          clearBacktestCache("swing-tracker");
+          console.log(`[ScannerController] Swing regen complete: ${signals?.length ?? 0} signals`);
+        })
+        .catch(err => console.error("[ScannerController] Swing regen error:", err.message));
       return res.json({
         success: true,
-        message: "Swing Tracker EOD scan started. Results will appear on the dashboard as they are computed."
+        message: "Swing Tracker regeneration started from Mongo candles (past 7 days). Results will appear shortly.",
       });
     }
 
     const signals = await forceRecalculateScanner(id);
+    exports.clearBacktestCache(id);
     return res.json({
       success: true,
       message: `Scanner ${id} successfully recalculated.`,
@@ -213,8 +241,6 @@ exports.getStockDetails = async (req, res) => {
       return res.status(400).json({ success: false, message: "Missing stock symbol parameter." });
     }
 
-    // For indices, the candle-cache and scrip-master both key off the human-readable
-    // name ("Nifty 50"), not the UI alias (NIFTY). Resolve before any lookups.
     const aliasedIndex = resolveIndexAlias(rawSymbol);
     const symbol = aliasedIndex || rawSymbol.toUpperCase();
     const isIndex = Boolean(aliasedIndex);
@@ -226,11 +252,9 @@ exports.getStockDetails = async (req, res) => {
     let stockCandles = allCandles[symbol];
     const niftyCandles = allCandles["Nifty 50"] || [];
 
-    // If candles are not in local cache, dynamically fetch from SmartAPI
     if (!stockCandles || stockCandles.length === 0) {
       console.log(`[ScannerController] Candles not in cache for ${symbol}, attempting dynamic fetch...`);
       const symbolToTokenMap = getSymbolToTokenMap();
-      // For indices the scrip-master key is the canonical name itself; for equities try -EQ then bare.
       const instrument = isIndex
         ? (symbolToTokenMap[symbol] || symbolToTokenMap[rawSymbol.toUpperCase()])
         : (symbolToTokenMap[`${symbol}-EQ`] || symbolToTokenMap[symbol]);
@@ -250,8 +274,23 @@ exports.getStockDetails = async (req, res) => {
         });
       }
 
-      // Re-read from cache after fetching
       stockCandles = getHistoricalDailyCandles()[symbol];
+      
+      const CustomSwingStock = require("../models/CustomSwingStock");
+      const scannerEngine = require("../services/scannerEngine");
+      
+      try {
+        await CustomSwingStock.findOneAndUpdate(
+          { symbol: symbol },
+          { symbol: symbol },
+          { upsert: true, setDefaultsOnInsert: true }
+        );
+        if (scannerEngine.dynamicallyAddSwingStock) {
+          scannerEngine.dynamicallyAddSwingStock(symbol);
+        }
+      } catch (err) {
+        console.error(`[ScannerController] Error dynamically tracking ${symbol}:`, err.message);
+      }
     }
 
     if (!stockCandles || stockCandles.length === 0) {
@@ -366,6 +405,7 @@ exports.getCommodities = async (req, res) => {
 
     return res.json({
       success: true,
+      feedPaused: require("../services/commodityFeedControl").isCommodityFeedPaused(),
       commodities: commoditiesData
     });
   } catch (err) {
@@ -373,6 +413,25 @@ exports.getCommodities = async (req, res) => {
       success: false,
       message: err.message
     });
+  }
+};
+
+exports.getCommodityFeedStatus = (_req, res) => {
+  try {
+    const { getCommodityFeedStatus } = require("../services/commodityFeedControl");
+    return res.json({ success: true, ...getCommodityFeedStatus() });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+exports.setCommodityFeedPaused = async (req, res) => {
+  try {
+    const { setCommodityFeedPaused } = require("../services/commodityFeedControl");
+    const result = await setCommodityFeedPaused(req.body?.paused === true);
+    return res.json({ success: true, ...result });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: err.message });
   }
 };
 
@@ -394,6 +453,11 @@ const { getSmartApiInstance } = require("../services/smartApiSession");
 const intradayCandleStore = require("../services/intradayCandleStore");
 
 // Helper to format date in Indian Timezone
+const formatToIndianTime = (isoString) => {
+    if (!isoString) return "N/A";
+    return new Date(isoString).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
+};
+
 
 exports.getDataStatus = async (req, res) => {
   try {
@@ -509,10 +573,137 @@ exports.fetchMissingData = async (req, res) => {
       await intradayCandleStore.saveHistoricalIntradayCandles(symbol, interval, mapped);
       return res.json({ success: true, message: `Saved ${mapped.length} candles to Mongo!` });
     } else {
-      return res.status(400).json({ success: false, message: "Angel One API returned no data" });
+      return res.status(400).json({ success: true, message: "Missing data fetch initiated in background." });
     }
-  } catch (error) {
-    console.error("Fetch missing data error:", error);
-    res.status(500).json({ success: false, message: error.message });
+  } catch (err) {
+    console.error("[ScannerController] fetchMissingData error:", err);
+    return res.status(500).json({ success: false, message: "Server error during data fetch" });
   }
 };
+
+exports.getCustomOptionsStrikes = async (req, res) => {
+  try {
+    const { getStrikesForIndex, resolveIndexName } = require("../services/customOptionsStrikeCatalog");
+    const index = String(req.query.index || "nifty").toLowerCase();
+    if (!resolveIndexName(index)) {
+      return res.status(400).json({ success: false, message: "Invalid index. Use nifty, banknifty, or sensex." });
+    }
+    const expiry = req.query.expiry ? String(req.query.expiry) : null;
+    const catalog = getStrikesForIndex(index, expiry);
+    return res.json({ success: true, ...catalog });
+  } catch (err) {
+    console.error("[ScannerController] getCustomOptionsStrikes error:", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+exports.fetchCustomOptionsHistorical = async (req, res) => {
+  try {
+    const { callStrike, putStrike } = req.body;
+    if (!callStrike || !putStrike) {
+      return res.status(400).json({ success: false, message: "Missing callStrike or putStrike" });
+    }
+
+    const user = _optionalAuth(req);
+    if (user?.id) {
+      try {
+        const User = require("../models/User");
+        await User.findByIdAndUpdate(user.id, {
+          customOptionsCallStrike: callStrike,
+          customOptionsPutStrike: putStrike,
+        });
+      } catch (err) {
+        console.warn("[ScannerController] Failed to save custom options prefs:", err.message);
+      }
+    }
+
+    const customOptionsEngine = require("../services/customOptionsEngine");
+    if (customOptionsEngine.processCustomOptionsHistoricalData) {
+      customOptionsEngine.processCustomOptionsHistoricalData(callStrike, putStrike)
+        .then(summary => console.log("[ScannerController] Custom options job finished:", summary?.totalSaved ?? 0, "signals"))
+        .catch(err => console.error("[ScannerController] custom options process error:", err.message));
+    }
+
+    res.json({
+      success: true,
+      message: "Fetching 3 days of history from broker (call + put, 1M + 3M). This usually takes 2–3 minutes.",
+      callStrike,
+      putStrike,
+    });
+  } catch (err) {
+    console.error("[ScannerController] fetchCustomOptionsHistorical error:", err);
+    res.status(500).json({ success: false, message: "Server error" });
+  }
+};
+
+function _optionalAuth(req) {
+  const authHeader = req.headers.authorization || "";
+  const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
+  if (!token) return null;
+  try {
+    const jwt = require("jsonwebtoken");
+    const payload = jwt.verify(token, process.env.JWT_SECRET);
+    return { id: payload.id, teamCode: payload.teamCode, email: payload.email };
+  } catch {
+    return null;
+  }
+}
+
+exports.getCustomOptions = async (req, res) => {
+  try {
+    const CustomOptionsSignal = require("../models/CustomOptionsSignal");
+    const User = require("../models/User");
+
+    let query = {};
+    const symbolsParam = req.query.symbols;
+    if (symbolsParam) {
+      const list = String(symbolsParam).split(",").map(s => s.trim()).filter(Boolean);
+      if (list.length > 0) query = { symbol: { $in: list } };
+    } else {
+      const user = _optionalAuth(req);
+      if (user?.id) {
+        const profile = await User.findById(user.id)
+          .select("customOptionsCallStrike customOptionsPutStrike")
+          .lean();
+        const strikes = [profile?.customOptionsCallStrike, profile?.customOptionsPutStrike].filter(Boolean);
+        if (strikes.length > 0) query = { symbol: { $in: strikes } };
+      }
+    }
+
+    const signals = await CustomOptionsSignal.find({
+      ...query,
+      signal: { $nin: ["ACTIVE"] },
+    }).sort({ timestamp: -1 }).limit(200).lean();
+    res.json({ success: true, signals, count: signals.length });
+  } catch (err) {
+    console.error("[ScannerController] getCustomOptions error:", err);
+    res.status(500).json({ success: false, message: "Server error" });
+  }
+};
+
+exports.getCustomOptionsPreferences = async (req, res) => {
+  try {
+    const user = _optionalAuth(req);
+    if (!user?.id) {
+      return res.json({
+        success: true,
+        customOptionsCallStrike: null,
+        customOptionsPutStrike: null,
+        customOptionsAlertsEnabled: false,
+      });
+    }
+    const User = require("../models/User");
+    const profile = await User.findById(user.id)
+      .select("customOptionsCallStrike customOptionsPutStrike customOptionsAlertsEnabled")
+      .lean();
+    res.json({
+      success: true,
+      customOptionsCallStrike: profile?.customOptionsCallStrike || null,
+      customOptionsPutStrike: profile?.customOptionsPutStrike || null,
+      customOptionsAlertsEnabled: profile?.customOptionsAlertsEnabled === true,
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
+

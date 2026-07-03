@@ -13,6 +13,8 @@
  *   - Exposes /api/admin/live-universe for observability.
  */
 require("dotenv").config();
+const runtimeFlags = require("./config/runtimeFlags");
+runtimeFlags.logRuntimeFlags();
 const express = require("express");
 const cors = require("cors");
 const connectDB = require("./config/db");
@@ -42,47 +44,69 @@ connectDB();
 
 async function startAngelOne() {
   try {
-    if (
+    const hasSmartApiCreds =
       process.env.SMARTAPI_API_KEY &&
       process.env.SMARTAPI_API_KEY !== "YOUR_API_KEY" &&
-      process.env.SMARTAPI_CLIENT_CODE !== "YOUR_CLIENT_CODE"
-    ) {
+      process.env.SMARTAPI_CLIENT_CODE !== "YOUR_CLIENT_CODE";
+
+    if (hasSmartApiCreds && runtimeFlags.needsSmartApiSession) {
       console.log("[SmartAPI] Initializing daily API session...");
       await initializeSession();
       await loadScripMaster();
 
-      // Open the websocket with NO pre-baked symbols.
-      // LiveUniverseManager will subscribe only the merged universe.
-      await connectWebSocket([]);
+      if (runtimeFlags.enableLiveWebSocket) {
+        // Open the websocket with NO pre-baked symbols.
+        // LiveUniverseManager will subscribe only the merged universe.
+        await connectWebSocket([]);
 
-      LiveUniverseManager.init({
-        subscribeToSymbols,
-        unsubscribeFromSymbols,
-        symbolToTokenMap,
-        onSymbolsRemoved: evictSymbolsFromCandleCache,
-      });
-      // First refresh runs the F&O + commodity sync against the freshly-loaded
-      // Scrip Master and emits the initial subscribe diff.
-      await LiveUniverseManager.refreshNow();
-      LiveUniverseManager.scheduleDailyRefresh();
-    } else {
+        LiveUniverseManager.init({
+          subscribeToSymbols,
+          unsubscribeFromSymbols,
+          symbolToTokenMap,
+          onSymbolsRemoved: evictSymbolsFromCandleCache,
+        });
+        await LiveUniverseManager.refreshNow();
+        LiveUniverseManager.scheduleDailyRefresh();
+      } else {
+        console.log("[SmartAPI] Live WebSocket disabled — REST-only SmartAPI mode.");
+      }
+    } else if (!hasSmartApiCreds) {
       console.log("[SmartAPI] Running without live broker credentials. Real-time scanner updates will be limited.");
+    } else {
+      console.log("[SmartAPI] SmartAPI session skipped — no scanners require live market data.");
     }
   } catch (error) {
     console.error("[SmartAPI] Background startup failed:", error.message);
   } finally {
-    startScannerEngine();
-    // Phase 3 — register commodity scanner with the registry,
-    // then let ScannerManager pick it up.
-    try {
-      const scannerRegistry  = require("./services/scannerRegistry");
-      const commodityScanner = require("./services/commodityScanner");
-      commodityScanner.register(scannerRegistry);
-    } catch (e) {
-      console.warn("[Server] Commodity scanner registration skipped:", e.message);
+    if (runtimeFlags.enableScannerEngine) {
+      startScannerEngine();
+    } else {
+      console.log("[ScannerEngine] Skipped — disabled by runtime flags.");
     }
-    scannerManager.start();   // Phase 2 — runs registered scanners
-    healthMonitor.start();    // Phase 8 — periodic RAM / CPU / latency sampling
+
+    if (runtimeFlags.enableCustomOptionsScanner) {
+      require("./services/customOptionsEngine");
+      console.log("[CustomOptionsEngine] Live alert scanner scheduled (market hours, ~90s interval)");
+    } else {
+      console.log("[CustomOptionsEngine] Skipped — disabled by runtime flags.");
+    }
+
+    if (runtimeFlags.enableCommodityScanner) {
+      try {
+        const scannerRegistry = require("./services/scannerRegistry");
+        const commodityScanner = require("./services/commodityScanner");
+        commodityScanner.register(scannerRegistry);
+        const commodityFeedControl = require("./services/commodityFeedControl");
+        scannerRegistry.setEnabled("commodity-momentum", !commodityFeedControl.isCommodityFeedPaused());
+        scannerManager.start();
+      } catch (e) {
+        console.warn("[Server] Commodity scanner registration skipped:", e.message);
+      }
+    } else {
+      console.log("[ScannerManager] Skipped — commodity scanner disabled.");
+    }
+
+    healthMonitor.start();
   }
 }
 // Phase 4 polish — defer HTTP server.listen() until startAngelOne() resolves so
@@ -107,7 +131,13 @@ app.use(express.json());
 app.get("/", (_req, res) => {
   res.type("html").send(`<!doctype html><html><body><h1>Trade Screener API is running</h1></body></html>`);
 });
-app.get("/health", (_req, res) => res.json({ status: "ok" }));
+app.get("/health", (_req, res) =>
+  res.json({
+    status: "ok",
+    scannerMode: runtimeFlags.scannerMode,
+    disableEodSwingScan: runtimeFlags.disableEodSwingScan
+  })
+);
 
 // Observability endpoint for the Live Universe
 app.get("/api/admin/live-universe", (_req, res) => {
@@ -205,5 +235,12 @@ const PORT = process.env.PORT || 5000;
 // .refreshNow → syncCommodityContracts) before opening the HTTP port, so the
 // first /api/scanner/commodities call finds the Mongo-backed universe ready.
 startupPromise.then(() => {
+  server.on("error", (err) => {
+    if (err.code === "EADDRINUSE") {
+      console.error(`[Server] Port ${PORT} is already in use. Stop the other backend process first (taskkill /F /IM node.exe) or set PORT in .env.`);
+      process.exit(1);
+    }
+    throw err;
+  });
   server.listen(PORT, () => console.log("Server running on port " + PORT));
 });

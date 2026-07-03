@@ -14,8 +14,12 @@ const allowedTypesForUser = (user) => {
   return types;
 };
 
-const visibleScopeQuery = (teamCode) => ({
-  $or: [{ scope: "GLOBAL" }, { scope: "TEAM", teamCode }]
+const visibleScopeQuery = (teamCode, userId) => ({
+  $or: [
+    { scope: "GLOBAL" },
+    { scope: "TEAM", teamCode },
+    { scope: "USER", recipientUserId: userId }
+  ]
 });
 
 router.get("/", auth, async (req, res) => {
@@ -45,7 +49,7 @@ router.get("/", auth, async (req, res) => {
 
     const query = {
       type: { $in: types },
-      ...visibleScopeQuery(user.teamCode)
+      ...visibleScopeQuery(user.teamCode, req.user.id)
     };
 
     const [total, items] = await Promise.all([
@@ -89,7 +93,7 @@ router.patch("/:notificationId/read", auth, async (req, res) => {
     const notification = await Notification.findOne({
       _id: req.params.notificationId,
       type: { $in: allowedTypesForUser(user) },
-      ...visibleScopeQuery(user.teamCode)
+      ...visibleScopeQuery(user.teamCode, req.user.id)
     });
 
     if (!notification) {
@@ -125,7 +129,7 @@ router.patch("/read-all", auth, async (req, res) => {
     await Notification.updateMany(
       {
         type: { $in: types },
-        ...visibleScopeQuery(user.teamCode)
+        ...visibleScopeQuery(user.teamCode, req.user.id)
       },
       { $addToSet: { readBy: req.user.id } }
     );

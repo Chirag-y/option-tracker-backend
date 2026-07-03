@@ -4,6 +4,7 @@ const UserSchema = new mongoose.Schema({
   name: { type: String, required: true, trim: true },
   email: { type: String, required: true, lowercase: true, trim: true },
   password: { type: String, required: true, minlength: 6 },
+  mustChangePassword: { type: Boolean, default: false },
   teamCode: { type: String, required: true, trim: true, index: true },
   isVerified: { type: Boolean, default: false, index: true },
   teamApprovalState: {
@@ -27,7 +28,10 @@ const UserSchema = new mongoose.Schema({
   tradeResultNotificationsEnabled: { type: Boolean, default: true },
   intradayStockAlertsEnabled: { type: Boolean, default: true },
   cockpitCardOrder: { type: [String], default: [] },
-  subscribedScanners: { type: [String], default: [] }
+  subscribedScanners: { type: [String], default: [] },
+  customOptionsCallStrike: { type: String, default: null },
+  customOptionsPutStrike: { type: String, default: null },
+  customOptionsAlertsEnabled: { type: Boolean, default: false }
 }, { timestamps: true });
 
 UserSchema.index({ email: 1, teamCode: 1 }, { unique: true });

@@ -18,6 +18,7 @@ const User = require("../models/User");
 const DailyCandle = require("../models/DailyCandle");
 const IntradayCandle = require("../models/IntradayCandle");
 const FoActiveTrade = require("../models/FoActiveTrade");
+const { computeFoPnlPct } = require("./foTradeUtils");
 const { sendPushToUsers } = require("../utils/onesignal");
 const { evaluateOptionsOpportunity } = require("./optionsOpportunityScanner");
 const {
@@ -63,6 +64,46 @@ const INTRADAY_UNIVERSE_LIMIT = 500;
 let intradayUniverse = [];
 // swingTrackerUniverse: F&O stocks for live scanning. nseEqUniverse is used for EOD-only swing scans.
 let swingTrackerUniverse = FO_UNIVERSE.filter(stock => !isEtf(stock.symbol));
+const CustomSwingStock = require("../models/CustomSwingStock");
+
+async function loadCustomSwingStocks() {
+  try {
+    const customStocks = await CustomSwingStock.find();
+    let loadedCount = 0;
+    for (const stock of customStocks) {
+      if (!swingTrackerUniverse.find(s => s.symbol === stock.symbol)) {
+        swingTrackerUniverse.push({
+          symbol: stock.symbol,
+          name: `${stock.symbol} Ltd.`,
+          sector: "Custom",
+          isFO: false,
+          marketCap: 0,
+          avgValue: 0,
+          price: 0
+        });
+        loadedCount++;
+      }
+    }
+    console.log(`[ScannerEngine] Loaded ${loadedCount} custom stocks into Swing Tracker Universe.`);
+  } catch (err) {
+    console.error("[ScannerEngine] Failed to load custom swing stocks:", err.message);
+  }
+}
+
+function dynamicallyAddSwingStock(symbol) {
+  if (!swingTrackerUniverse.find(s => s.symbol === symbol)) {
+    swingTrackerUniverse.push({
+      symbol: symbol,
+      name: `${symbol} Ltd.`,
+      sector: "Custom",
+      isFO: false,
+      marketCap: 0,
+      avgValue: 0,
+      price: 0
+    });
+    console.log(`[ScannerEngine] Dynamically added ${symbol} to live swingTrackerUniverse.`);
+  }
+}
 
 // Active Trigger Memory (Sticky Signals)
 // Structure: { [scannerId]: { [symbol]: { triggerTime, triggerPrice, ... } } }
@@ -170,16 +211,18 @@ function getLatestHistoricalClose(symbol) {
 }
 
 function saveHistoricalIntradayCandlesToCache() {
-  try {
-    const dir = path.dirname(intradayCandlesCachePath);
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
+  // Defer disk write — synchronous 30MB+ JSON.stringify blocks the event loop.
+  setImmediate(() => {
+    try {
+      const dir = path.dirname(intradayCandlesCachePath);
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      fs.promises.writeFile(intradayCandlesCachePath, JSON.stringify(historicalIntradayCandles))
+        .then(() => console.log(`[ScannerEngine] Saved ${Object.keys(historicalIntradayCandles).length} historical intraday candles to local cache.`))
+        .catch(err => console.error("[ScannerEngine] Failed to save intraday candles to cache:", err.message));
+    } catch (err) {
+      console.error("[ScannerEngine] Failed to save intraday candles to cache:", err.message);
     }
-    fs.writeFileSync(intradayCandlesCachePath, JSON.stringify(historicalIntradayCandles, null, 2));
-    console.log(`[ScannerEngine] Saved ${Object.keys(historicalIntradayCandles).length} historical intraday candles to local cache.`);
-  } catch (err) {
-    console.error("[ScannerEngine] Failed to save intraday candles to cache:", err.message);
-  }
+  });
 }
 
 function loadHistoricalIntradayCandlesFromCache() {
@@ -188,7 +231,9 @@ function loadHistoricalIntradayCandlesFromCache() {
       const parsed = JSON.parse(fs.readFileSync(intradayCandlesCachePath, "utf-8"));
       const validated = {};
 
+      const allowedSymbols = new Set(FO_UNIVERSE.map(s => s.symbol)); allowedSymbols.add("Nifty 50"); allowedSymbols.add("Nifty Bank"); allowedSymbols.add("SENSEX");
       for (const [symbol, frames] of Object.entries(parsed)) {
+        if (!allowedSymbols.has(symbol)) continue; // OOM FIX
         if (!frames) continue;
         const validFrames = {};
         for (const [frameName, series] of Object.entries(frames)) {
@@ -213,17 +258,52 @@ function loadHistoricalIntradayCandlesFromCache() {
   return false;
 }
 
-function saveHistoricalDailyCandlesToCache() {
+/** Async cache load — avoids blocking the event loop on a ~30MB JSON parse at boot. */
+async function loadHistoricalIntradayCandlesFromCacheAsync() {
   try {
-    const dir = path.dirname(candlesCachePath);
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
+    if (!fs.existsSync(intradayCandlesCachePath)) return false;
+    await new Promise(resolve => setImmediate(resolve));
+    const raw = await fs.promises.readFile(intradayCandlesCachePath, "utf-8");
+    await new Promise(resolve => setImmediate(resolve));
+    const parsed = JSON.parse(raw);
+    const validated = {};
+    const allowedSymbols = new Set(FO_UNIVERSE.map(s => s.symbol));
+    allowedSymbols.add("Nifty 50"); allowedSymbols.add("Nifty Bank"); allowedSymbols.add("SENSEX");
+    for (const [symbol, frames] of Object.entries(parsed)) {
+      if (!allowedSymbols.has(symbol)) continue;
+      if (!frames) continue;
+      const validFrames = {};
+      for (const [frameName, series] of Object.entries(frames)) {
+        if (hasOnlyRealisticIntradayCandles(series)) validFrames[frameName] = series;
+      }
+      if (Object.keys(validFrames).length > 0) validated[symbol] = validFrames;
     }
-    fs.writeFileSync(candlesCachePath, JSON.stringify(historicalDailyCandles, null, 2));
-    console.log(`[ScannerEngine] Saved ${Object.keys(historicalDailyCandles).length} historical daily candles to local cache.`);
+    historicalIntradayCandles = validated;
+    console.log(`[ScannerEngine] Loaded ${Object.keys(historicalIntradayCandles).length} intraday candle series from local cache (async).`);
+    return Object.keys(validated).length > 0;
   } catch (err) {
-    console.error("[ScannerEngine] Failed to save candles to cache:", err.message);
+    console.error("[ScannerEngine] Failed to load intraday candles from cache:", err.message);
+    return false;
   }
+}
+
+function saveHistoricalDailyCandlesToCache() {
+  const symbolCount = Object.keys(historicalDailyCandles).length;
+  if (symbolCount < 20) {
+    console.log(`[ScannerEngine] Skipping daily cache save (${symbolCount} symbols — would overwrite full cache).`);
+    return;
+  }
+  setImmediate(() => {
+    try {
+      const dir = path.dirname(candlesCachePath);
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      fs.promises.writeFile(candlesCachePath, JSON.stringify(historicalDailyCandles))
+        .then(() => console.log(`[ScannerEngine] Saved ${Object.keys(historicalDailyCandles).length} historical daily candles to local cache.`))
+        .catch(err => console.error("[ScannerEngine] Failed to save candles to cache:", err.message));
+    } catch (err) {
+      console.error("[ScannerEngine] Failed to save candles to cache:", err.message);
+    }
+  });
 }
 
 function loadHistoricalDailyCandlesFromCache() {
@@ -232,7 +312,9 @@ function loadHistoricalDailyCandlesFromCache() {
       const parsed = JSON.parse(fs.readFileSync(candlesCachePath, "utf-8"));
       const validated = {};
 
+      const allowedSymbols = new Set(FO_UNIVERSE.map(s => s.symbol)); allowedSymbols.add("Nifty 50"); allowedSymbols.add("Nifty Bank"); allowedSymbols.add("SENSEX");
       for (const [symbol, series] of Object.entries(parsed)) {
+        if (!allowedSymbols.has(symbol)) continue; // OOM FIX
         if (hasOnlyRealisticDailyCandles(series)) {
           validated[symbol] = series;
         } else {
@@ -250,6 +332,30 @@ function loadHistoricalDailyCandlesFromCache() {
   return false;
 }
 
+/** Async daily cache load — deferred so boot never blocks on a multi-MB JSON parse. */
+async function loadHistoricalDailyCandlesFromCacheAsync() {
+  try {
+    if (!fs.existsSync(candlesCachePath)) return false;
+    await new Promise(resolve => setImmediate(resolve));
+    const raw = await fs.promises.readFile(candlesCachePath, "utf-8");
+    await new Promise(resolve => setImmediate(resolve));
+    const parsed = JSON.parse(raw);
+    const validated = {};
+    const allowedSymbols = new Set(FO_UNIVERSE.map(s => s.symbol));
+    allowedSymbols.add("Nifty 50"); allowedSymbols.add("Nifty Bank"); allowedSymbols.add("SENSEX");
+    for (const [symbol, series] of Object.entries(parsed)) {
+      if (!allowedSymbols.has(symbol)) continue;
+      if (hasOnlyRealisticDailyCandles(series)) validated[symbol] = series;
+    }
+    historicalDailyCandles = validated;
+    console.log(`[ScannerEngine] Loaded ${Object.keys(historicalDailyCandles).length} daily candle series from local cache (async).`);
+    return Object.keys(validated).length > 0;
+  } catch (err) {
+    console.error("[ScannerEngine] Failed to load candles from cache:", err.message);
+    return false;
+  }
+}
+
 /**
  * Phase 1 — hydrate the in-memory daily candle cache from MongoDB at startup.
  * Mongo is the source of truth; the JSON file is a legacy backup.
@@ -259,9 +365,34 @@ function loadHistoricalDailyCandlesFromCache() {
  *   2. Then overlay any Mongo-persisted series on top (more authoritative).
  * If Mongo is unreachable we silently keep the JSON state.
  */
+function getBootScopedDailySymbols() {
+  const symbols = new Set(["Nifty 50", "Nifty Bank", "SENSEX"]);
+  for (const s of FO_UNIVERSE) {
+    if (s?.symbol) symbols.add(s.symbol);
+  }
+  return [...symbols];
+}
+
+/** FO + indices daily candles — only needed for live FO/swing eval during market hours, not at boot. */
+async function ensureLiveScannerDailyCandles() {
+  if (liveDailyCandlesReady) return;
+  await loadHistoricalDailyCandlesFromCacheAsync();
+  await hydrateDailyCandlesFromMongo();
+  liveDailyCandlesReady = true;
+  console.log(`[ScannerEngine] Live scanner daily candles ready (${Object.keys(historicalDailyCandles).length} symbols).`);
+}
+
+let liveDailyCandlesReady = false;
+
+async function ensureNseEqUniverseForEod() {
+  if (nseEqUniverse.length > 0) return;
+  await initializeNseEqUniverse();
+}
+
 async function hydrateDailyCandlesFromMongo() {
+  const bootSymbols = getBootScopedDailySymbols();
   try {
-    const fromMongo = await dailyCandleStore.loadAll();
+    const fromMongo = await dailyCandleStore.loadSymbols(bootSymbols);
     const symbols = Object.keys(fromMongo);
     if (symbols.length === 0) {
       console.log("[ScannerEngine] Mongo daily candle store is empty (cold start).");
@@ -287,16 +418,22 @@ async function hydrateDailyCandlesFromMongo() {
 let lastSectorsData = null;
 let lastMarketOverview = null;
 
-const scannerIds = [
+const ALL_LEGACY_SCANNER_IDS = [
   "fo-bullish", "fo-bearish", "options-bullish", "options-bearish", "swing-tracker",
   "nifty-signals", "banknifty-signals", "sensex-signals"
 ];
+
+function getLegacyScannerIds() {
+  const { getActiveLegacyScannerIds } = require("../config/runtimeFlags");
+  const active = getActiveLegacyScannerIds();
+  return active.length ? active : ALL_LEGACY_SCANNER_IDS;
+}
 
 registerOnConnectionCallback((socket) => {
   console.log(`[ScannerEngine] Client connected (${socket.id}). Sending cached dashboard state...`);
 
   // Send latest active scanner signals
-  for (const sId of scannerIds) {
+  for (const sId of getLegacyScannerIds()) {
     if (activeSignalsMemory[sId]) {
       const list = Object.values(activeSignalsMemory[sId]);
       list.sort((a, b) => b.strengthScore - a.strengthScore);
@@ -727,13 +864,14 @@ async function fetchHistoricalIntradayCandles(symbolKey, token, segment, interva
       const fromStr = formatOffsetDate(fromDate);
       const toStr = formatOffsetDate(toDate);
 
-      const response = await api.getCandleData({
+      const { getCandleDataQueued } = require("./globalCandleApiQueue");
+      const response = await getCandleDataQueued({
         exchange: segment === "BSE" ? "BSE" : "NSE",
         symboltoken: token,
         interval: interval,
         fromdate: fromStr,
         todate: toStr
-      });
+      }, { label: `scanner:${symbolKey}:${interval}` });
 
       const candleRows = extractCandleRows(response);
       if (candleRows.length > 0) {
@@ -789,20 +927,40 @@ async function fetchHistoricalIntradayCandles(symbolKey, token, segment, interva
 
 async function hydrateIntradayCandlesFromMongo() {
   console.log("[ScannerEngine] Hydrating intraday candles from Mongo...");
-  const foStocks = FO_UNIVERSE.filter(s => !isEtf(s.symbol));
+  const targets = FO_UNIVERSE.filter(s => !isEtf(s.symbol)).map(s => s.symbol);
+  targets.push("Nifty 50", "Nifty Bank", "SENSEX");
   let loadedCount = 0;
-  for (const stock of foStocks) {
-    const candles = await intradayCandleStore.loadHistoricalIntradayCandles(stock.symbol, "FIVE_MINUTE");
-    if (candles && candles.length > 0) {
-      if (!historicalIntradayCandles[stock.symbol]) historicalIntradayCandles[stock.symbol] = {};
-      historicalIntradayCandles[stock.symbol]["FIVE_MINUTE"] = candles;
-      loadedCount++;
-    }
+  const BATCH = 25;
+  for (let i = 0; i < targets.length; i += BATCH) {
+    const batch = targets.slice(i, i + BATCH);
+    await Promise.all(batch.map(async (symbol) => {
+      const candles = await intradayCandleStore.loadHistoricalIntradayCandles(symbol, "FIVE_MINUTE");
+      if (candles && candles.length > 0) {
+        if (!historicalIntradayCandles[symbol]) historicalIntradayCandles[symbol] = {};
+        historicalIntradayCandles[symbol]["FIVE_MINUTE"] = candles;
+        loadedCount++;
+      }
+    }));
   }
-  console.log(`[ScannerEngine] Successfully hydrated intraday candles for ${loadedCount} F&O stocks.`);
+  console.log(`[ScannerEngine] Successfully hydrated intraday candles for ${loadedCount} symbols.`);
 }
 
 async function preloadAllHistoricalIntradayCandles() {
+  const { isScannerIntradayPreloadPaused } = require("./apiQuotaGuard");
+
+  const skipIndex = process.env.DISABLE_INDEX_INTRADAY_PRELOAD === "true";
+  const skipFo = process.env.DISABLE_FO_INTRADAY_PRELOAD === "true";
+
+  if (skipIndex && skipFo) {
+    console.log("[ScannerEngine] All intraday preload disabled (index + F&O env flags).");
+    return;
+  }
+
+  if (isScannerIntradayPreloadPaused()) {
+    console.log("[ScannerEngine] Intraday preload deferred — Custom Options fetch in progress.");
+    return;
+  }
+
   const now = new Date();
   const nowStr = now.toISOString().split("T")[0];
 
@@ -813,9 +971,15 @@ async function preloadAllHistoricalIntradayCandles() {
 
   const niftyCandles = historicalIntradayCandles["Nifty 50"]?.["FIVE_MINUTE"];
   if (niftyCandles && niftyCandles.length > 0) {
-    const lastCandleDate = niftyCandles[niftyCandles.length - 1].date.split("T")[0];
-    if (lastCandleDate === nowStr) {
-      console.log("[ScannerEngine] Today's intraday candles already exist in DB. Skipping historical pull from Angel One.");
+    const lastCandle = niftyCandles[niftyCandles.length - 1];
+    const lastCandleDate = lastCandle.date.split("T")[0];
+    const lastCandleTime = new Date(lastCandle.date).getTime();
+    const timeDiffMinutes = (now.getTime() - lastCandleTime) / (1000 * 60);
+
+    // If we have today's data AND it's less than 15 mins old, skip API pull.
+    // If it's more than 15 mins old (e.g. app restarted mid-day), fall through and fetch missing candles.
+    if (lastCandleDate === nowStr && timeDiffMinutes < 15) {
+      console.log("[ScannerEngine] Today's intraday candles are fresh (< 15 mins old). Skipping historical pull from Angel One.");
       return;
     }
   }
@@ -837,16 +1001,27 @@ async function preloadAllHistoricalIntradayCandles() {
 
   // Pre-filter targets so we only fetch missing data!
   for (const item of targets) {
+    if (isScannerIntradayPreloadPaused()) {
+      console.log("[ScannerEngine] Intraday preload stopped — Custom Options has API priority.");
+      return;
+    }
+
     const lookupKey = item.isFO ? `${item.symbol}-EQ` : item.symbol;
     const instrument = symbolToTokenMap[lookupKey];
     if (!instrument) continue;
 
     if (!item.isFO) {
+      if (skipIndex) continue;
       await fetchHistoricalIntradayCandles(item.symbolKey, instrument.token, instrument.segment, "ONE_MINUTE", 7);
       await new Promise(resolve => setTimeout(resolve, 400));
       await fetchHistoricalIntradayCandles(item.symbolKey, instrument.token, instrument.segment, "THREE_MINUTE", 7);
       await new Promise(resolve => setTimeout(resolve, 400));
+      await fetchHistoricalIntradayCandles(item.symbolKey, instrument.token, instrument.segment, "FIVE_MINUTE", 7);
+      await new Promise(resolve => setTimeout(resolve, 400));
+      continue;
     }
+
+    if (skipFo) continue;
 
     await fetchHistoricalIntradayCandles(item.symbolKey, instrument.token, instrument.segment, "FIVE_MINUTE", 7);
     
@@ -1172,19 +1347,18 @@ async function evaluateAllScanners() {
 
   const niftyPrice = niftyData ? niftyData.ltp : 22140.65;
   const niftyChangePercent = niftyData ? niftyData.changePercent : 0.83;
-  // Derive close from changePercent when tickCache.close is undefined/0
-  const niftyClose = niftyData ? (niftyData.close || (niftyChangePercent !== 0 ? Number((niftyPrice / (1 + niftyChangePercent / 100)).toFixed(2)) : niftyPrice)) : 21958.25;
-  const niftyChange = niftyData ? (niftyData.change || Number((niftyPrice - niftyClose).toFixed(2))) : 0;
+  const niftyClose = niftyData ? (niftyData.close || niftyPrice) : 21958.25;
+  const niftyChange = Number((niftyPrice - niftyClose).toFixed(2));
 
   const bankNiftyPrice = bankNiftyData ? bankNiftyData.ltp : 47420.95;
   const bankNiftyChangePercent = bankNiftyData ? bankNiftyData.changePercent : 1.11;
-  const bankNiftyClose = bankNiftyData ? (bankNiftyData.close || (bankNiftyChangePercent !== 0 ? Number((bankNiftyPrice / (1 + bankNiftyChangePercent / 100)).toFixed(2)) : bankNiftyPrice)) : 46900.80;
-  const bankNiftyChange = bankNiftyData ? (bankNiftyData.change || Number((bankNiftyPrice - bankNiftyClose).toFixed(2))) : 0;
+  const bankNiftyClose = bankNiftyData ? (bankNiftyData.close || bankNiftyPrice) : 46900.80;
+  const bankNiftyChange = Number((bankNiftyPrice - bankNiftyClose).toFixed(2));
 
   const sensexPrice = sensexData ? sensexData.ltp : 72648.30;
   const sensexChangePercent = sensexData ? sensexData.changePercent : 0.85;
-  const sensexClose = sensexData ? (sensexData.close || (sensexChangePercent !== 0 ? Number((sensexPrice / (1 + sensexChangePercent / 100)).toFixed(2)) : sensexPrice)) : 72036.10;
-  const sensexChange = sensexData ? (sensexData.change || Number((sensexPrice - sensexClose).toFixed(2))) : 0;
+  const sensexClose = sensexData ? (sensexData.close || sensexPrice) : 72036.10;
+  const sensexChange = Number((sensexPrice - sensexClose).toFixed(2));
 
   const giftNiftyPrice = Number((niftyPrice + 35.5).toFixed(2));
   const giftNiftyChangePercent = niftyChangePercent;
@@ -1229,8 +1403,7 @@ async function evaluateAllScanners() {
 
     const clonedCandles = JSON.parse(JSON.stringify(candles));
     const lastCandle = clonedCandles[clonedCandles.length - 1];
-    const nowIST = new Date(new Date().getTime() + 5.5 * 60 * 60 * 1000);
-    const nowStr = nowIST.toISOString().split("T")[0];
+    const nowStr = new Date().toISOString().split("T")[0];
     if (lastCandle.date === nowStr) {
       lastCandle.close = ltp;
       lastCandle.high = Math.max(lastCandle.high, ltp);
@@ -1251,7 +1424,7 @@ async function evaluateAllScanners() {
     stockIndicatorsMap[stock.symbol] = getStockIndicators(clonedCandles);
   });
 
-  for (const scannerId of scannerIds) {
+  for (const scannerId of getLegacyScannerIds()) {
     if (!activeSignalsMemory[scannerId]) {
       activeSignalsMemory[scannerId] = {};
     }
@@ -1264,14 +1437,25 @@ async function evaluateAllScanners() {
       continue;
     }
 
-    // Clear sticky cache for swing/F&O scanners to only show today's triggers
     const isSwingScanner = scannerId === "swing-tracker";
     const isFoScanner = ["fo-bullish", "fo-bearish", "options-bullish", "options-bearish"].includes(scannerId);
-    if (isSwingScanner) {
-      activeSignalsMemory[scannerId] = {};
-    }
+    // Swing signals persist until manual refresh / EOD regen — do not wipe every 60s loop.
 
-    const loopNow = new Date(); if (loopNow.getHours() === 9 && loopNow.getMinutes() < 20 && isFoScanner) { continue; } const currentSignals = [];
+    const loopNowIST = new Date(new Date().getTime() + 5.5 * 60 * 60 * 1000);
+    if (loopNowIST.getUTCHours() === 9 && loopNowIST.getUTCMinutes() < 20 && isFoScanner) { continue; }
+    const timeNowIST = new Date(new Date().getTime() + 5.5 * 60 * 60 * 1000);
+    const isEodSquareOff = (timeNowIST.getUTCHours() > 15 || (timeNowIST.getUTCHours() === 15 && timeNowIST.getUTCMinutes() >= 25));
+    if (isFoScanner && isEodSquareOff) {
+       for (const sym in activeSignalsMemory[scannerId]) {
+           const existingSignal = activeSignalsMemory[scannerId][sym];
+           if (existingSignal && existingSignal._id) FoActiveTrade.updateOne({ _id: existingSignal._id }, { status: "CLOSED" }).catch(console.error);
+           if (activeFoTradesMap[scannerId]) delete activeFoTradesMap[scannerId][sym];
+       }
+       activeSignalsMemory[scannerId] = {};
+       broadcastScannerUpdate(scannerId, []);
+       continue;
+    }
+    const currentSignals = [];
     let targetStocks = activeStocks;
     if (scannerId === "swing-tracker") {
       targetStocks = swingTrackerUniverse;
@@ -1307,8 +1491,15 @@ async function evaluateAllScanners() {
       let triggered = false;
       let strengthScore = 50;
       let direction = "BULLISH";
-      let signalCandleTimestamp = null; // Will hold the actual candle date/time from the indicator result
+      let signalCandleTimestamp = null;
       let exitConditionMet = false;
+      const calcEma5Min = (trackerCandles, period = 20) => {
+         if (!trackerCandles || trackerCandles.length === 0) return 0;
+         const closes = trackerCandles.map(c => c.close);
+         let m = 2 / (period + 1), ema = closes[0];
+         for(let i = 1; i < closes.length; i++) ema = (closes[i] - ema) * m + ema;
+         return ema;
+      };
 
       switch (scannerId) {
         case "fo-bullish": {
@@ -1331,30 +1522,42 @@ async function evaluateAllScanners() {
           if (trackerRes.length === 0) continue;
           let lastSignal = trackerRes[trackerRes.length - 1];
           
-          
-          const nowIST = new Date(new Date().getTime() + 5.5 * 60 * 60 * 1000);
-    const nowStr = nowIST.toISOString().split("T")[0];
-          for (let i = trackerRes.length - 1; i >= 0; i--) {
-            if (trackerRes[i].date.split("T")[0] !== nowStr) break;
-            if (trackerRes[i].signal === "LONG") {
-               lastSignal = trackerRes[i];
-               signalCandleTimestamp = trackerRes[i].date;
-               triggered = true;
-               break;
-            } else if (trackerRes[i].signal === "SHORT") {
-               break;
-            }
+          if (!isMarketOpen()) {
+             const nowStr = trackerRes[trackerRes.length - 1].date.split("T")[0];
+             for (let i = trackerRes.length - 1; i >= 0; i--) {
+                if (trackerRes[i].date.split("T")[0] !== nowStr) break;
+                if (trackerRes[i].signal === "LONG") {
+                   lastSignal = trackerRes[i];
+                   triggered = true;
+                   break;
+                } else if (trackerRes[i].signal === "SHORT") {
+                   break;
+                }
+             }
+          } else {
+             triggered = lastSignal && lastSignal.signal === "LONG";
           }
-
           direction = "BULLISH";
           
           const niftyCandles = historicalDailyCandles["Nifty 50"] || [];
           const metrics = computeStockMetrics(stock.symbol, trackerCandles, niftyCandles);
+          
+          const existingSignal = activeSignalsMemory[scannerId]?.[stock.symbol];
+          const ema20_5min = calcEma5Min(trackerCandles, 20);
+          const isShort = lastSignal && lastSignal.signal === "SHORT";
+          if (ltp < ema20_5min || isShort) {
+            exitConditionMet = true;
+            triggered = false;
+          }
+
           if (metrics) {
-            const strengthResult = calculateStrengthScore(metrics, "BULLISH");
+            const strengthResult = calculateStrengthScore(metrics);
             strengthScore = strengthResult.score;
           } else {
             strengthScore = 50;
+          }
+          if (triggered && lastSignal?.date) {
+            signalCandleTimestamp = lastSignal.date;
           }
           break;
         }
@@ -1378,30 +1581,42 @@ async function evaluateAllScanners() {
           if (trackerRes.length === 0) continue;
           let lastSignal = trackerRes[trackerRes.length - 1];
           
-          
-          const nowIST = new Date(new Date().getTime() + 5.5 * 60 * 60 * 1000);
-    const nowStr = nowIST.toISOString().split("T")[0];
-          for (let i = trackerRes.length - 1; i >= 0; i--) {
-            if (trackerRes[i].date.split("T")[0] !== nowStr) break;
-            if (trackerRes[i].signal === "SHORT") {
-               lastSignal = trackerRes[i];
-               signalCandleTimestamp = trackerRes[i].date;
-               triggered = true;
-               break;
-            } else if (trackerRes[i].signal === "LONG") {
-               break;
-            }
+          if (!isMarketOpen()) {
+             const nowStr = trackerRes[trackerRes.length - 1].date.split("T")[0];
+             for (let i = trackerRes.length - 1; i >= 0; i--) {
+                if (trackerRes[i].date.split("T")[0] !== nowStr) break;
+                if (trackerRes[i].signal === "SHORT") {
+                   lastSignal = trackerRes[i];
+                   triggered = true;
+                   break;
+                } else if (trackerRes[i].signal === "LONG") {
+                   break;
+                }
+             }
+          } else {
+             triggered = lastSignal && lastSignal.signal === "SHORT";
           }
-
           direction = "BEARISH";
           
           const niftyCandles = historicalDailyCandles["Nifty 50"] || [];
           const metrics = computeStockMetrics(stock.symbol, trackerCandles, niftyCandles);
+          
+          const existingSignal = activeSignalsMemory[scannerId]?.[stock.symbol];
+          const ema20_5min = calcEma5Min(trackerCandles, 20);
+          const isLong = lastSignal && lastSignal.signal === "LONG";
+          if (ltp > ema20_5min || isLong) {
+            exitConditionMet = true;
+            triggered = false;
+          }
+
           if (metrics) {
-            const strengthResult = calculateStrengthScore(metrics, "BEARISH");
+            const strengthResult = calculateStrengthScore(metrics);
             strengthScore = strengthResult.score;
           } else {
             strengthScore = 50;
+          }
+          if (triggered && lastSignal?.date) {
+            signalCandleTimestamp = lastSignal.date;
           }
           break;
         }
@@ -1412,13 +1627,14 @@ async function evaluateAllScanners() {
           const ind = stockIndicatorsMap[stock.symbol];
           const result = evaluateOptionsOpportunity(stock, ind, liveData, marketOverview);
           const existingSignal = activeSignalsMemory[scannerId]?.[stock.symbol];
-          if (existingSignal && result && result.triggered && result.direction === "BEARISH") {
-            exitConditionMet = true;
+          const ema20_5min = calcEma5Min(trackerCandles, 20);
+          if (ltp < ema20_5min || (result && result.triggered && result.direction === "BEARISH")) {
+             exitConditionMet = true;
+             triggered = false;
           } else if (result && result.triggered && result.direction === "BULLISH") { // note optionsOpportunityScanner uses "BULLISH" and "BEARISH"
             triggered = true;
             direction = "BULLISH";
             strengthScore = result.strengthScore;
-            signalCandleTimestamp = trackerCandles[trackerCandles.length - 1].date;
           }
           break;
         }
@@ -1428,11 +1644,15 @@ async function evaluateAllScanners() {
           const marketOverview = lastMarketOverview || { trendScore: 50, niftyChangePercent: niftyChangePercent };
           const ind = stockIndicatorsMap[stock.symbol];
           const result = evaluateOptionsOpportunity(stock, ind, liveData, marketOverview);
-          if (result && result.triggered && result.direction === "BEARISH") {
+          const existingSignal = activeSignalsMemory[scannerId]?.[stock.symbol];
+          const ema20_5min = calcEma5Min(trackerCandles, 20);
+          if (ltp > ema20_5min || (result && result.triggered && result.direction === "BULLISH")) {
+             exitConditionMet = true;
+             triggered = false;
+          } else if (result && result.triggered && result.direction === "BEARISH") {
             triggered = true;
             direction = "BEARISH";
             strengthScore = result.strengthScore;
-            signalCandleTimestamp = trackerCandles[trackerCandles.length - 1].date;
           }
           break;
         }
@@ -1444,8 +1664,7 @@ async function evaluateAllScanners() {
           }
           trackerCandles = JSON.parse(JSON.stringify(trackerCandles));
           const lastCandle = trackerCandles[trackerCandles.length - 1];
-          const nowIST = new Date(new Date().getTime() + 5.5 * 60 * 60 * 1000);
-    const nowStr = nowIST.toISOString().split("T")[0];
+          const nowStr = new Date().toISOString().split("T")[0];
           // Update last candle with live data if available, or append today's candle if market is open
           if (liveData && lastCandle.date === nowStr) {
             lastCandle.close = ltp;
@@ -1469,17 +1688,17 @@ async function evaluateAllScanners() {
           const lastSignal = trackerRes.signals[trackerRes.signals.length - 1];
           const latestCandle = trackerCandles[trackerCandles.length - 1];
           triggered = lastSignal && lastSignal.date === latestCandle.date;
-          if (triggered) signalCandleTimestamp = lastSignal.date;
           direction = lastSignal && lastSignal.action === "BUY" ? "BULLISH" : "BEARISH";
           
           const niftyCandles = historicalDailyCandles["Nifty 50"] || [];
           const metrics = computeStockMetrics(stock.symbol, trackerCandles, niftyCandles);
           if (metrics) {
-            const strengthResult = calculateStrengthScore(metrics, "BEARISH");
+            const strengthResult = calculateStrengthScore(metrics);
             strengthScore = strengthResult.score;
           } else {
             strengthScore = trackerRes.summary.winRate || 50;
           }
+          if (lastSignal?.date) signalCandleTimestamp = lastSignal.date;
           break;
         }
         default:
@@ -1495,35 +1714,50 @@ async function evaluateAllScanners() {
       // Mongo Active Trade check
       if (triggered && isFoScanner && !existingSignal) {
         if (activeFoTradesMap[scannerId] && activeFoTradesMap[scannerId][stock.symbol]) {
-          triggered = false; // Already active in Mongo, suppress duplicate trigger
+          triggered = false;
         } else {
-          // Save to Mongo with actual candle timestamp
-          const newTrade = new FoActiveTrade({
+          const triggeredAt = signalCandleTimestamp ? new Date(signalCandleTimestamp) : new Date();
+          const existingActive = await FoActiveTrade.findOne({
             symbol: stock.symbol,
-            direction: direction,
-            scannerId: scannerId,
-            entryPrice: ltp,
-            strengthScore: strengthScore,
-            triggeredAt: signalCandleTimestamp ? new Date(signalCandleTimestamp) : new Date()
-          });
-          await newTrade.save().catch(console.error);
-          if (!activeFoTradesMap[scannerId]) activeFoTradesMap[scannerId] = {};
-          activeFoTradesMap[scannerId][stock.symbol] = newTrade;
+            scannerId,
+            status: "ACTIVE",
+          }).lean();
+          if (existingActive) {
+            triggered = false;
+            if (!activeFoTradesMap[scannerId]) activeFoTradesMap[scannerId] = {};
+            activeFoTradesMap[scannerId][stock.symbol] = existingActive;
+          } else {
+            const newTrade = new FoActiveTrade({
+              symbol: stock.symbol,
+              direction: direction,
+              scannerId: scannerId,
+              entryPrice: ltp,
+              strengthScore: strengthScore,
+              triggeredAt,
+            });
+            await newTrade.save().catch(console.error);
+            if (!activeFoTradesMap[scannerId]) activeFoTradesMap[scannerId] = {};
+            activeFoTradesMap[scannerId][stock.symbol] = newTrade;
+          }
         }
       }
+
 
       if (exitConditionMet && existingSignal) {
         const trade = activeFoTradesMap[scannerId]?.[stock.symbol];
         if (trade && trade._id) {
-          FoActiveTrade.updateOne({ _id: trade._id }, { status: 'CLOSED' }).catch(console.error);
+          const tradeDir = trade.direction || existingSignal.direction || direction;
+          const entryPx = trade.entryPrice || existingSignal.triggerPrice || ltp;
+          const pnlPct = computeFoPnlPct(tradeDir, entryPx, ltp);
+          FoActiveTrade.updateOne(
+            { _id: trade._id },
+            { status: "CLOSED", closedAt: new Date(), exitPrice: ltp, pnlPct }
+          ).catch(console.error);
         }
         delete activeSignalsMemory[scannerId][stock.symbol];
-        if (activeFoTradesMap[scannerId]) {
-          delete activeFoTradesMap[scannerId][stock.symbol];
-        }
+        if (activeFoTradesMap[scannerId]) delete activeFoTradesMap[scannerId][stock.symbol];
         continue;
       }
-
       if (triggered || existingSignal) {
         let signalInfo;
 
@@ -1538,8 +1772,19 @@ async function evaluateAllScanners() {
             direction: direction,
             volumeScore: Math.round(volumeRatio * 40),
             trendScore: Math.round(rsiVal),
-            timestamp: signalCandleTimestamp ? new Date(signalCandleTimestamp).toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata", hour12: false }) : new Date().toLocaleTimeString(),
-            triggerTime: signalCandleTimestamp ? new Date(signalCandleTimestamp).toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata", hour12: false }) : new Date().toLocaleTimeString(),
+            timestamp: signalCandleTimestamp
+              ? new Date(signalCandleTimestamp).toLocaleString("en-IN", { timeZone: "Asia/Kolkata" })
+              : new Date().toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata" }),
+            triggerTime: signalCandleTimestamp
+              ? (typeof signalCandleTimestamp === "string" && /^\d{4}-\d{2}-\d{2}$/.test(signalCandleTimestamp)
+                ? signalCandleTimestamp
+                : new Date(signalCandleTimestamp).toLocaleString("en-IN", { timeZone: "Asia/Kolkata" }))
+              : new Date().toISOString().split("T")[0],
+            triggerDate: signalCandleTimestamp
+              ? (typeof signalCandleTimestamp === "string" && /^\d{4}-\d{2}-\d{2}$/.test(signalCandleTimestamp)
+                ? new Date(`${signalCandleTimestamp}T00:00:00+05:30`)
+                : new Date(signalCandleTimestamp))
+              : new Date(),
             triggerPrice: ltp,
             postTriggerChange: 0,
             strengthScore: strengthScore,
@@ -1733,58 +1978,29 @@ async function evaluateAllScanners() {
     { name: "NIFTY REITS REAL ESTATE", indexSymbol: "Nifty Realty", offset: 0.05 }
   ];
 
-  const getTopStocksForSector = (sectorName, sectorChange) => {
-    const foSectorsMap = {
-      "HDFCBANK": "Banking", "ICICIBANK": "Banking", "SBIN": "Banking", "AXISBANK": "Banking", "KOTAKBANK": "Banking", "INDUSINDBK": "Banking", "BANKBARODA": "Banking", "PNB": "Banking", "FEDERALBNK": "Banking", "IDFCFIRSTB": "Banking", "AUBANK": "Banking", "BANDHANBNK": "Banking",
-      "RELIANCE": "Energy", "ONGC": "Energy", "NTPC": "Energy", "POWERGRID": "Energy", "COALINDIA": "Energy", "TATAPOWER": "Energy", "BPCL": "Energy", "IOC": "Energy", "GAIL": "Energy", "PETRONET": "Energy", "IGL": "Energy", "MGL": "Energy", "OIL": "Energy",
-      "TCS": "IT", "INFY": "IT", "HCLTECH": "IT", "WIPRO": "IT", "TECHM": "IT", "LTIM": "IT", "PERSISTENT": "IT", "COFORGE": "IT", "MPHASIS": "IT", "LTTS": "IT",
-      "ITC": "FMCG", "HINDUNILVR": "FMCG", "NESTLEIND": "FMCG", "BRITANNIA": "FMCG", "TATACONSUM": "FMCG", "GODREJCP": "FMCG", "DABUR": "FMCG", "MARICO": "FMCG", "COLPAL": "FMCG", "UNITEDSPIRITS": "FMCG", "UBL": "FMCG", "RADICO": "FMCG", "BALRAMCHIN": "FMCG",
-      "MARUTI": "Auto", "M&M": "Auto", "TATAMOTORS": "Auto", "BAJAJ-AUTO": "Auto", "EICHERMOT": "Auto", "HEROMOTOCO": "Auto", "TVSMOTOR": "Auto", "BOSCHLTD": "Auto", "MRF": "Auto", "APOLLOTYRE": "Auto", "BALKRISIND": "Auto", "ESCORTS": "Auto", "ASHOKLEY": "Auto", "MOTHERSON": "Auto",
-      "SUNPHARMA": "Pharma", "DRREDDY": "Pharma", "CIPLA": "Pharma", "DIVISLAB": "Pharma", "LUPIN": "Pharma", "AUROPHARMA": "Pharma", "TORNTPHARM": "Pharma", "ZYDUSLIFE": "Pharma", "ALKEM": "Pharma", "BIOCON": "Pharma", "SYNGENE": "Pharma", "GRANULES": "Pharma", "GLENMARK": "Pharma", "LAURUSLABS": "Pharma",
-      "TATASTEEL": "Metals", "JSWSTEEL": "Metals", "HINDALCO": "Metals", "VEDL": "Metals", "JINDALSTEL": "Metals", "SAIL": "Metals", "NMDC": "Metals", "NATIONALUM": "Metals",
-      "ULTRACEMCO": "Metals", "GRASIM": "Metals", "AMBUJACEM": "Metals", "SHREECEM": "Metals", "ACC": "Metals", "DALBHARAT": "Metals", "RAMCOCEM": "Metals", "INDIACEM": "Metals",
-      "BAJFINANCE": "Finance", "BAJAJFINSV": "Finance", "CHOLAFIN": "Finance", "SHRIRAMFIN": "Finance", "MUTHOOTFIN": "Finance", "MANAPPURAM": "Finance", "PFC": "Finance", "RECLTD": "Finance", "M&MFIN": "Finance", "LICHSGFIN": "Finance", "L&TFH": "Finance", "IBULHSGFIN": "Finance", "ABCAPITAL": "Finance", "CANFINHOME": "Finance",
-      "DLF": "Infrastructure", "GODREJPROP": "Infrastructure", "LODHA": "Infrastructure", "OBEROIRLTY": "Infrastructure", "LT": "Infrastructure", "GMRINFRA": "Infrastructure", "BHEL": "Infrastructure", "HAL": "Infrastructure", "BEL": "Infrastructure",
-      "BHARTIARTL": "Telecommunication", "IDEA": "Telecommunication", "INDUSINDBK": "Telecommunication",
-      "ZEEL": "Media", "SUNTV": "Media", "PVRINOX": "Media",
-      "DIXON": "Consumer", "VOLTAS": "Consumer", "HAVELLS": "Consumer", "CUMMINSIND": "Consumer", "CROMPTON": "Consumer", "BATAINDIA": "Consumer", "PAGEIND": "Consumer", "TITAN": "Consumer", "ASIANPAINT": "Consumer", "BERGEPAINT": "Consumer", "PIDILITIND": "Consumer", "TRENT": "Consumer"
-    };
-    
+  const getTopStocksForSector = (sectorName) => {
     let targetSector = "";
     const name = sectorName.toUpperCase();
     if (name.includes("BANK")) targetSector = "Banking";
-    else if (name.includes("FIN ") || name.includes("FINANCIAL")) targetSector = "Finance";
     else if (name.includes("IT")) targetSector = "IT";
     else if (name.includes("PHARMA") || name.includes("HEALTHCARE") || name.includes("HLTH")) targetSector = "Pharma";
     else if (name.includes("AUTO")) targetSector = "Auto";
-    else if (name.includes("FMCG") || name.includes("DURABLES") || name.includes("CONSUMER")) targetSector = "FMCG";
+    else if (name.includes("FMCG") || name.includes("DURABLES")) targetSector = "FMCG";
     else if (name.includes("METAL") || name.includes("CEMENT") || name.includes("CHEMICAL")) targetSector = "Metals";
-    else if (name.includes("ENERGY") || name.includes("OIL") || name.includes("GAS") || name.includes("POWER")) targetSector = "Energy";
-    else if (name.includes("REALTY") || name.includes("REITS") || name.includes("INFRA")) targetSector = "Infrastructure";
-    else if (name.includes("MEDIA")) targetSector = "Media";
-    else targetSector = "Banking"; // default fallback
+    else if (name.includes("ENERGY") || name.includes("OIL") || name.includes("GAS")) targetSector = "Energy";
+    else targetSector = "Metals"; // default fallback
 
-    const sectorStocks = FO_UNIVERSE.filter(s => {
-      const stockSector = foSectorsMap[s.symbol] || "Other";
-      return stockSector === targetSector;
-    });
+    const sectorStocks = STOCK_UNIVERSE.filter(s => s.sector === targetSector);
 
-    let sorted = sectorStocks
+    return sectorStocks
       .map(s => {
         const symbolKey = s.isFO ? `${s.symbol}-EQ` : s.symbol;
-        const live = tickCache[symbolKey] || tickCache[s.symbol] || s;
+        const live = tickCache[symbolKey] || s;
         return { symbol: s.symbol, change: live.changePercent || live.change || 0 };
-      });
-      
-    if (sectorChange >= 0) {
-      // Bullish sector: show top gainers
-      sorted = sorted.sort((a, b) => b.change - a.change);
-    } else {
-      // Bearish sector: show top losers
-      sorted = sorted.sort((a, b) => a.change - b.change);
-    }
-
-    return sorted.map(s => s.symbol).slice(0, 2);
+      })
+      .sort((a, b) => b.change - a.change)
+      .map(s => s.symbol)
+      .slice(0, 3);
   };
 
   const sectorsData = sectorsConfig.map(cfg => {
@@ -1796,7 +2012,7 @@ async function evaluateAllScanners() {
 
     const score = Math.min(100, Math.max(0, Math.round(50 + changePercent * 15)));
     const weeklyChange = Number((changePercent * 3).toFixed(2));
-    const topStocks = getTopStocksForSector(cfg.name, changePercent);
+    const topStocks = getTopStocksForSector(cfg.name);
 
     return {
       name: cfg.name,
@@ -1815,7 +2031,7 @@ async function evaluateAllScanners() {
   // Count total bullish vs bearish active signals across scanners
   let totalBullish = 0;
   let totalBearish = 0;
-  for (const sId of scannerIds) {
+  for (const sId of getLegacyScannerIds()) {
     if (activeSignalsMemory[sId]) {
       for (const sym in activeSignalsMemory[sId]) {
         const sig = activeSignalsMemory[sId][sym];
@@ -1991,7 +2207,7 @@ async function fetchRealClosingPrices() {
       { symbol: "Nifty Energy", isFO: true },
       { symbol: "Nifty PSE", isFO: true },
       { symbol: "Nifty Serv Sector", isFO: true },
-      ...FO_UNIVERSE
+      ...STOCK_UNIVERSE
     ];
 
     // Group tokens by exchange/segment to format the exchangeTokens payload
@@ -2044,35 +2260,27 @@ async function fetchRealClosingPrices() {
           if (symbolKey === "INFY-EQ") symbolKey = "INFOSYS-EQ";
           if (symbolKey === "BHARTIARTL-EQ") symbolKey = "BHARTIRTEL-EQ";
           if (symbolKey === "TMPV-EQ") symbolKey = "TATAMOTORS-EQ";
-          const baseSymbol = symbolKey.split("-")[0];
           const ltp = parseFloat(item.ltp);
-          const histFallback = historicalDailyCandles[baseSymbol]?.slice(-1)[0]?.close || ltp;
-          const close = parseFloat(item.close || histFallback);
+          const close = parseFloat(item.close || item.open || ltp);
           const changePercent = close > 0 ? ((ltp - close) / close) * 100 : 0;
-          const absoluteChange = close > 0 ? Number((ltp - close).toFixed(2)) : 0;
           const volume = parseInt(item.tradeVolume) || 0;
 
-          // Update tickCache under both symbol-EQ and base symbol
-          const snapshot = {
+          // Update tickCache
+          tickCache[symbolKey] = {
             ltp: ltp,
             volume: volume,
             changePercent: Number(changePercent.toFixed(2)),
-            change: absoluteChange,
+            change: Number((ltp - close).toFixed(2)),
             timestamp: new Date().toLocaleTimeString(),
             token: instrument.token,
             segment: instrument.segment,
             price: ltp,
-            close: close
+            close: close,
+            prevDayClose: close,
           };
-          tickCache[symbolKey] = snapshot;
-          tickCache[baseSymbol] = snapshot;
-
-          // For index symbols, also store under their canonical names
-          if (token === "26000") { tickCache["Nifty 50"] = snapshot; }
-          if (token === "26009") { tickCache["Nifty Bank"] = snapshot; }
-          if (token === "19000") { tickCache["SENSEX"] = snapshot; }
 
           // Update in STOCK_UNIVERSE so global filters and initial values match
+          const baseSymbol = symbolKey.split("-")[0];
           const universeStock = STOCK_UNIVERSE.find(s => s.symbol === baseSymbol);
           if (universeStock) {
             universeStock.price = ltp;
@@ -2093,6 +2301,63 @@ async function fetchRealClosingPrices() {
   }
 }
 
+/**
+ * Seed MCX commodity contracts with previous close from REST marketData.
+ */
+async function fetchCommodityClosingPrices() {
+  console.log("[ScannerEngine] Fetching MCX commodity closing prices...");
+  try {
+    const { getActiveCommodityUniverse } = require("./commodityContractManager");
+    const universe = await getActiveCommodityUniverse();
+    if (!universe || universe.length === 0) return;
+
+    const api = getSmartApiInstance();
+    const tickCache = getTickCache();
+    const tokens = [];
+
+    for (const item of universe) {
+      const instrument = symbolToTokenMap[item.symbol];
+      if (instrument) tokens.push(instrument.token);
+    }
+    if (tokens.length === 0) return;
+
+    const response = await api.marketData({
+      mode: "FULL",
+      exchangeTokens: { MCX: tokens },
+    });
+
+    if (response && response.status === true && response.data && response.data.fetched) {
+      for (const item of response.data.fetched) {
+        const token = item.symbolToken;
+        const instrument = tokenToSymbolMap[token];
+        if (!instrument) continue;
+
+        const symbolKey = instrument.symbol;
+        const ltp = parseFloat(item.ltp);
+        const close = parseFloat(item.close || item.open || ltp);
+        const changePercent = close > 0 ? ((ltp - close) / close) * 100 : 0;
+        const existing = tickCache[symbolKey] || {};
+
+        tickCache[symbolKey] = {
+          ...existing,
+          ltp,
+          price: ltp,
+          close,
+          prevDayClose: close,
+          change: Number((ltp - close).toFixed(2)),
+          changePercent: Number(changePercent.toFixed(2)),
+          timestamp: new Date().toLocaleTimeString(),
+          token: instrument.token,
+          segment: instrument.segment,
+        };
+        console.log(`[ScannerEngine] Loaded MCX close for ${symbolKey}: ₹${ltp} (${changePercent.toFixed(2)}%)`);
+      }
+    }
+  } catch (err) {
+    console.error("[ScannerEngine] fetchCommodityClosingPrices failed:", err.message);
+  }
+}
+
 // Separate interval handle for the 60-second scanner loop
 let scannerInterval = null;
 
@@ -2100,7 +2365,7 @@ let scannerInterval = null;
  * Starts the 2-second LTP-only price update loop.
  * Only broadcasts price updates — does NOT run heavy scanner calculations.
  */
-function startCalculationLoop() {
+function startCalculationLoop({ skipInitialEval = false } = {}) {
   if (calculationInterval) return;
   console.log("[ScannerEngine] Starting 2-second LTP price update loop...");
   calculationInterval = setInterval(() => {
@@ -2116,8 +2381,9 @@ function startCalculationLoop() {
           console.error("[ScannerEngine] Scanner loop error:", err.message);
         });
     }, 60000);
-    // Also run once immediately on market open so dashboard isn't blank
-    evaluateAllScanners().catch(err => console.error("[ScannerEngine] Initial scanner run error:", err.message));
+    if (!skipInitialEval) {
+      evaluateAllScanners().catch(err => console.error("[ScannerEngine] Initial scanner run error:", err.message));
+    }
   }
 }
 
@@ -2156,11 +2422,10 @@ function broadcastLivePrices() {
       else if (sym === "Nifty Bank") broadcastSym = "BANKNIFTY";
       else if (sym.endsWith("-EQ")) broadcastSym = sym.replace("-EQ", "");
       
-      if (broadcastSym === "NIFTY" || broadcastSym === "BANKNIFTY") {
-        console.log(`[broadcastLivePrices] Emitting ${broadcastSym}: ${data.ltp || data.price}`);
-      }
-
-      broadcastPriceUpdate(broadcastSym, data.ltp || data.price || 0, data.changePercent || 0);
+      broadcastPriceUpdate(broadcastSym, data.ltp || data.price || 0, data.changePercent || 0, {
+        change: data.change,
+        prevClose: data.prevDayClose || data.close,
+      });
     }
   }
 }
@@ -2173,7 +2438,13 @@ function broadcastLivePrices() {
  * server restart after 3:40 PM does NOT re-run the full 1600-symbol fetch.
  */
 function scheduleEodSwingScan() {
-  console.log("[ScannerEngine] EOD Swing Scan scheduler started (checks every 5 minutes)...");
+  const { disableEodSwingScan } = require("../config/runtimeFlags");
+  if (disableEodSwingScan) {
+    console.log("[ScannerEngine] EOD Swing Scan scheduler disabled by runtime flags.");
+    return;
+  }
+
+  console.log("[ScannerEngine] EOD Swing Scan scheduler armed (polls every 5 min; runs once after 3:40 PM IST only)...");
   setInterval(async () => {
     if (!isAfterMarketClose()) return; // Not yet 3:40 PM IST
 
@@ -2204,6 +2475,13 @@ function scheduleEodSwingScan() {
  *   - Triggered signals are upserted to SwingCandidate via recordSwingSignal.
  */
 async function runEodSwingScan() {
+  const { disableEodSwingScan } = require("../config/runtimeFlags");
+  if (disableEodSwingScan) {
+    console.log("[ScannerEngine] EOD Swing Scan skipped — disabled by runtime flags.");
+    return { skipped: true, reason: "EOD scan disabled" };
+  }
+
+  await ensureNseEqUniverseForEod();
   const universe = nseEqUniverse.length > 0 ? nseEqUniverse : FO_UNIVERSE;
   console.log(`[ScannerEngine] EOD Swing Scan starting for ${universe.length} stocks...`);
   if (!activeSignalsMemory["swing-tracker"]) {
@@ -2273,7 +2551,7 @@ async function runEodSwingScan() {
     const direction = lastSignal.action === "BUY" ? "BULLISH" : "BEARISH";
     const niftyCandles = historicalDailyCandles["Nifty 50"] || [];
     const metrics = computeStockMetrics(stock.symbol, trackerCandles, niftyCandles);
-    const strengthResult = metrics ? calculateStrengthScore(metrics, "BEARISH") : { score: trackerRes.summary.winRate || 50 };
+    const strengthResult = metrics ? calculateStrengthScore(metrics) : { score: trackerRes.summary.winRate || 50 };
 
     const signalRecord = {
       symbol: stock.symbol,
@@ -2284,6 +2562,7 @@ async function runEodSwingScan() {
       direction,
       strengthScore: strengthResult.score,
       triggerTime: lastSignal.date,
+      triggerDate: lastSignal.date ? new Date(`${lastSignal.date}T00:00:00+05:30`) : new Date(),
       triggerPrice: latestCandle.close,
       scannerName: "Swing Tracker",
       scannerId: "swing-tracker",
@@ -2345,6 +2624,9 @@ async function restoreRecentSwingSignals() {
       };
     }
     console.log(`[ScannerEngine] Restored ${recent.length} recent swing signals from Mongo.`);
+    const list = Object.values(activeSignalsMemory["swing-tracker"])
+      .sort((a, b) => (b.strengthScore || 0) - (a.strengthScore || 0));
+    broadcastScannerUpdate("swing-tracker", list);
     return recent.length;
   } catch (err) {
     console.warn("[ScannerEngine] restoreRecentSwingSignals failed:", err.message);
@@ -2372,12 +2654,17 @@ function stopCalculationLoop() {
  * Initializes and starts the background calculation engine.
  */
 function startScannerEngine() {
+  const runtimeFlags = require("../config/runtimeFlags");
+  if (!runtimeFlags.enableScannerEngine) {
+    console.log("[ScannerEngine] Not started — disabled by runtime flags.");
+    return;
+  }
+
   isOfflineMode = false;
   lastKnownMarketOpenState = isMarketOpen();
 
-  // Load historical daily candles from cache at startup
-  loadHistoricalDailyCandlesFromCache();
-  loadHistoricalIntradayCandlesFromCache();
+  // Candle caches load asynchronously after the fast path — never block boot on 30MB+ JSON.parse.
+  console.log("[ScannerEngine] Candle caches will load in background after fast path.");
 
   console.log("[ScannerEngine] Running in live-only mode. Cached-real-history fallback is enabled; synthetic feeds are disabled.");
   if (!process.env.SMARTAPI_API_KEY || !process.env.SMARTAPI_CLIENT_CODE || !process.env.SMARTAPI_PASSWORD) {
@@ -2385,37 +2672,39 @@ function startScannerEngine() {
   }
 
   const bootstrap = async () => {
-    await initializeNseEqUniverse();
+    await loadCustomSwingStocks();
 
-    // Phase 1 - hydrate daily candles from Mongo in the background
-    hydrateDailyCandlesFromMongo().catch(err => console.error("[ScannerEngine] Hydrate daily failed:", err.message));
-    
-    // Phase 1.5 - hydrate intraday candles from Mongo in the background
-    await hydrateIntradayCandlesFromMongo().catch(err => console.error("[ScannerEngine] Hydrate intraday failed:", err.message));
-    
-    if (!isMarketOpen()) {
-      console.log("[ScannerEngine] Market closed at boot. Running initial evaluation to populate dashboard.");
-      evaluateAllScanners();
-    }
-
-    // Phase 5 - restore recent swing-tracker triggers from Mongo restore recent swing-tracker triggers from Mongo so the
+    if (runtimeFlags.enableSwingScanner) {
+    // Phase 5 - restore recent swing-tracker triggers from Mongo so the
     // dashboard isn't empty after a restart on the same trading day.
     await restoreRecentSwingSignals();
+    }
 
-    // Phase 6 - Hydrate UI with last 7 days of FO Trades
+    // Phase 6 — Hydrate UI with last 3 trading days of FO trades (use triggeredAt, not createdAt)
+    if (runtimeFlags.enableFoScanner) {
     console.log("[ScannerEngine] Hydrating activeSignalsMemory with FoActiveTrade history...");
     try {
       const FoActiveTrade = require('../models/FoActiveTrade');
-      const todayStart = new Date();
-      todayStart.setHours(0, 0, 0, 0);
-        
-      const tradesToHydrate = await FoActiveTrade.find({ status: 'ACTIVE' });
+      const { FO_HISTORICAL_DAYS, tradingDaysAgo } = require("./historicalSignalRegenerator");
+      const cutoff = tradingDaysAgo(FO_HISTORICAL_DAYS);
+
+      const tradesToHydrate = await FoActiveTrade.find({
+        triggeredAt: { $gte: cutoff },
+        status: { $in: ["ACTIVE", "CLOSED"] },
+      }).sort({ triggeredAt: -1 });
       let hydratedCount = 0;
+      const { getLatestMarketDateFromMongo } = require("./historicalSignalRegenerator");
+      const latestMarketDay = await getLatestMarketDateFromMongo().catch(() => dailyCandleStore.getIstTradingDate());
       
       for (const t of tradesToHydrate) {
+        const tradeDay = dailyCandleStore.getIstTradingDate(t.triggeredAt || t.createdAt);
+        if (tradeDay !== latestMarketDay) continue;
+
         if (!activeSignalsMemory[t.scannerId]) activeSignalsMemory[t.scannerId] = {};
+        if (activeSignalsMemory[t.scannerId][t.symbol]) continue;
         
         const stockObj = swingTrackerUniverse.find(s => s.symbol === t.symbol) || { name: t.symbol, sector: "Unknown" };
+        const trigAt = t.triggeredAt || t.createdAt;
         
         activeSignalsMemory[t.scannerId][t.symbol] = {
           symbol: t.symbol,
@@ -2426,8 +2715,8 @@ function startScannerEngine() {
           direction: t.direction,
           volumeScore: 0,
           trendScore: 50,
-          timestamp: t.triggeredAt ? new Date(t.triggeredAt).toLocaleTimeString() : new Date().toLocaleTimeString(),
-          triggerTime: t.triggeredAt ? new Date(t.triggeredAt).toLocaleTimeString() : new Date().toLocaleTimeString(),
+          timestamp: trigAt.toLocaleString("en-IN", { timeZone: "Asia/Kolkata" }),
+          triggerTime: trigAt.toLocaleString("en-IN", { timeZone: "Asia/Kolkata" }),
           triggerPrice: t.entryPrice,
           postTriggerChange: 0,
           strengthScore: t.strengthScore || 65,
@@ -2437,43 +2726,76 @@ function startScannerEngine() {
         hydratedCount++;
       }
       console.log(`[ScannerEngine] Hydrated ${hydratedCount} FO trades from Mongo into UI memory.`);
+
+      for (const foId of ["fo-bullish", "fo-bearish"]) {
+        if (activeSignalsMemory[foId] && Object.keys(activeSignalsMemory[foId]).length > 0) {
+          const list = Object.values(activeSignalsMemory[foId])
+            .sort((a, b) => (b.strengthScore || 0) - (a.strengthScore || 0));
+          broadcastScannerUpdate(foId, list);
+        }
+      }
+
+      const foBullCount = Object.keys(activeSignalsMemory["fo-bullish"] || {}).length;
+      const foBearCount = Object.keys(activeSignalsMemory["fo-bearish"] || {}).length;
+      if (foBullCount === 0 && foBearCount === 0) {
+        setTimeout(() => {
+          Promise.all([
+            regenerateScannerFromMongo("fo-bullish", 3),
+            regenerateScannerFromMongo("fo-bearish", 3),
+          ]).catch(err => console.warn("[ScannerEngine] Boot FO regen failed:", err.message));
+        }, 30_000);
+      }
     } catch(err) {
       console.error("[ScannerEngine] Failed to hydrate FoActiveTrades:", err.message);
     }
+    }
 
-    const commodityUniverse = getCommodityUniverse();
+    if (runtimeFlags.enableSwingScanner) {
+    const swingCount = Object.keys(activeSignalsMemory["swing-tracker"] || {}).length;
+    if (swingCount === 0) {
+      setTimeout(() => {
+        regenerateScannerFromMongo("swing-tracker", 7).catch(err =>
+          console.warn("[ScannerEngine] Boot swing regen failed:", err.message)
+        );
+      }, 30_000);
+    }
+    }
 
-    // Live subscriptions are now owned exclusively by LiveUniverseManager
-    // (see server.js). It already merged F&O + Swing(3d) + Indices + Commodities
-    // and emitted a subscribe diff before this bootstrap ran.
-    // Keeping `commodityUniverse` reference above for backward-compat with code
-    // below that may read its length, but no further subscribeToSymbols() call here.
-    void commodityUniverse;
+    if (runtimeFlags.enableCommodityScanner) {
+    void getCommodityUniverse();
+    }
 
+    // Fast path — dashboard from Mongo signals + index prices only (no 1600+ candle load).
     await preloadAllHistoricalDailyCandles();
-
-    // Preload intraday candles BEFORE starting scanner loop — this MUST be awaited
-    // otherwise the scanner will skip all F&O stocks because 5-min candles aren't ready
-    await preloadAllHistoricalIntradayCandles()
-      .catch(err => console.error("[ScannerEngine] Intraday preload failed:", err.message));
-    
-    startBackgroundCandlePreload();
-      
     await fetchRealClosingPrices();
-
-    // Log diagnostic info before starting scanner
-    const intradaySymbolCount = Object.keys(historicalIntradayCandles).length;
-    const fiveMinCount = Object.keys(historicalIntradayCandles).filter(s => historicalIntradayCandles[s]?.["FIVE_MINUTE"]?.length > 0).length;
-    console.log(`[ScannerEngine] DIAGNOSTIC: historicalIntradayCandles has ${intradaySymbolCount} symbols, ${fiveMinCount} have FIVE_MINUTE data`);
-    console.log(`[ScannerEngine] DIAGNOSTIC: historicalDailyCandles has ${Object.keys(historicalDailyCandles).length} symbols`);
-    console.log(`[ScannerEngine] DIAGNOSTIC: tickCache has ${Object.keys(getTickCache()).length} entries`);
-    console.log(`[ScannerEngine] DIAGNOSTIC: swingTrackerUniverse has ${swingTrackerUniverse.length} stocks`);
-
-    // Always start the LTP + scanner loops
-    startCalculationLoop();
-
-    // Schedule the EOD Swing Scan to run automatically after 3:40 PM
+    if (runtimeFlags.enableCommodityScanner) {
+      await fetchCommodityClosingPrices();
+    }
+    startCalculationLoop({ skipInitialEval: true });
     scheduleEodSwingScan();
+
+    if (runtimeFlags.enableFoScanner) {
+    // Live FO intraday only (~206 symbols). Full NSE EQ daily candles load at EOD (3:40 PM IST).
+    hydrateIntradayCandlesFromMongo()
+      .then(() => {
+        if (isMarketOpen()) {
+          return ensureLiveScannerDailyCandles().then(() =>
+            evaluateAllScanners().catch(err => console.error("[ScannerEngine] Live eval failed:", err.message))
+          );
+        }
+      })
+      .catch(err => console.error("[ScannerEngine] Hydrate intraday failed:", err.message));
+
+    if (runtimeFlags.enableBackgroundPreload) {
+      preloadAllHistoricalIntradayCandles()
+        .then(() => startBackgroundCandlePreload())
+        .catch(err => console.error("[ScannerEngine] Intraday preload failed:", err.message));
+    } else {
+      console.log("[ScannerEngine] Background intraday preload skipped by runtime flags.");
+    }
+    } else {
+      console.log("[ScannerEngine] FO live scanner path skipped by runtime flags.");
+    }
   };
 
   bootstrap().catch(err => console.error("[ScannerEngine] Failed to bootstrap live-only scanner engine:", err.message));
@@ -2489,6 +2811,8 @@ function startScannerEngine() {
       if (currentlyOpen) {
         console.log("[ScannerEngine] Market has opened. Seeding prices and activating live calculation loop.");
         fetchRealClosingPrices()
+          .then(() => fetchCommodityClosingPrices())
+          .then(() => ensureLiveScannerDailyCandles())
           .then(() => startCalculationLoop())
           .catch(err => console.error("[ScannerEngine] Failed to seed prices on market open:", err.message));
       } else {
@@ -2504,19 +2828,70 @@ function startScannerEngine() {
 }
 
 /**
+ * Apply regenerated historical signals to in-memory dashboard + broadcast.
+ */
+function applyRegeneratedDashboardSignals(scannerId, signals) {
+  if (!activeSignalsMemory[scannerId]) activeSignalsMemory[scannerId] = {};
+  activeSignalsMemory[scannerId] = {};
+  for (const sig of signals || []) {
+    activeSignalsMemory[scannerId][sig.symbol] = sig;
+  }
+  const list = Object.values(activeSignalsMemory[scannerId])
+    .sort((a, b) => (b.strengthScore || 0) - (a.strengthScore || 0));
+  broadcastScannerUpdate(scannerId, list);
+  return list;
+}
+
+/**
+ * Regenerate past N days from Mongo and refresh dashboard (manual refresh / boot helper).
+ */
+async function regenerateScannerFromMongo(scannerId, days = 7) {
+  const { regenerateSwingSignalsFromMongo, regenerateFoSignalsFromMongo } = require("./historicalSignalRegenerator");
+
+  if (scannerId === "swing-tracker") {
+    const result = await regenerateSwingSignalsFromMongo({
+      days,
+      dailyCandlesRam: historicalDailyCandles,
+    });
+    const list = applyRegeneratedDashboardSignals("swing-tracker", result.dashboardSignals);
+    return list;
+  }
+
+  if (["fo-bullish", "fo-bearish"].includes(scannerId)) {
+    const result = await regenerateFoSignalsFromMongo({
+      days,
+      scannerIds: [scannerId],
+      intradayRam: historicalIntradayCandles,
+    });
+    const list = applyRegeneratedDashboardSignals(scannerId, result.dashboardSignals[scannerId] || []);
+    return list;
+  }
+
+  throw new Error(`Historical regen not supported for scanner: ${scannerId}`);
+}
+
+/**
  * Forces a manual calculation and broadcast of a specific scanner.
  */
 async function forceRecalculateScanner(scannerId) {
   console.log(`[ScannerEngine] Force recalculate requested for: ${scannerId}`);
 
-  // Clear the throttle timestamp so that it gets set to now
+  if (scannerId === "swing-tracker") {
+    return regenerateScannerFromMongo(scannerId, 7);
+  }
+  if (["fo-bullish", "fo-bearish"].includes(scannerId)) {
+    const { FO_HISTORICAL_DAYS } = require("./historicalSignalRegenerator");
+    return regenerateScannerFromMongo(scannerId, FO_HISTORICAL_DAYS);
+  }
+
   const now = Date.now();
   if (lastRunTimestamps[scannerId] !== undefined) {
     lastRunTimestamps[scannerId] = now;
   }
 
   const tickCache = getTickCache();
-
+  const niftyData = tickCache["Nifty 50"];
+  const niftyChangePercent = niftyData ? (niftyData.changePercent || niftyData.change || 0.83) : 0.83;
   // Determine target stocks list based on scanner type
   const isSwingScanner = scannerId === "swing-tracker";
   const isFoScanner = ["fo-bullish", "fo-bearish", "options-bullish", "options-bearish"].includes(scannerId);
@@ -2548,14 +2923,15 @@ async function forceRecalculateScanner(scannerId) {
 
   const stockIndicatorsMap = {};
   targetStocks.forEach(stock => {
-    if (isEtf(stock.symbol)) return; // Skip ETF globally
-    if ((isSwingScanner || isFoScanner) && !isOfflineMode && !historicalDailyCandles[stock.symbol]) {
-      return; // Skip if daily candles not preloaded yet
+    if (isEtf(stock.symbol)) return;
+    if ((isSwingScanner || isFoScanner) && !historicalDailyCandles[stock.symbol]) {
+      return;
     }
     const symbolKey = stock.isFO ? `${stock.symbol}-EQ` : stock.symbol;
     const liveData = tickCache[symbolKey];
-    if (!liveData) return;
-    const ltp = liveData.price || liveData.ltp || 0;
+    const ltpFallback = historicalDailyCandles[stock.symbol]?.slice(-1)[0]?.close || 0;
+    const ltp = liveData ? (liveData.price || liveData.ltp || 0) : ltpFallback;
+    if (!isSwingScanner && !isFoScanner && !liveData) return;
 
     const candles = historicalDailyCandles[stock.symbol];
     if (!candles || candles.length === 0) {
@@ -2564,8 +2940,7 @@ async function forceRecalculateScanner(scannerId) {
 
     const clonedCandles = JSON.parse(JSON.stringify(candles));
     const lastCandle = clonedCandles[clonedCandles.length - 1];
-    const nowIST = new Date(new Date().getTime() + 5.5 * 60 * 60 * 1000);
-    const nowStr = nowIST.toISOString().split("T")[0];
+    const nowStr = dailyCandleStore.getIstTradingDate();
     if (lastCandle.date === nowStr) {
       lastCandle.close = ltp;
       lastCandle.high = Math.max(lastCandle.high, ltp);
@@ -2617,6 +2992,7 @@ async function forceRecalculateScanner(scannerId) {
     let triggered = false;
     let strengthScore = 50;
     let direction = "BULLISH";
+    let signalCandleTimestamp = null;
 
     switch (scannerId) {
       case "fo-bullish": {
@@ -2638,26 +3014,27 @@ async function forceRecalculateScanner(scannerId) {
         if (trackerRes.length === 0) continue;
         let lastSignal = trackerRes[trackerRes.length - 1];
         
-        
-          const nowIST = new Date(new Date().getTime() + 5.5 * 60 * 60 * 1000);
-    const nowStr = nowIST.toISOString().split("T")[0];
-          for (let i = trackerRes.length - 1; i >= 0; i--) {
-            if (trackerRes[i].date.split("T")[0] !== nowStr) break;
-            if (trackerRes[i].signal === "LONG") {
-               lastSignal = trackerRes[i];
-               triggered = true;
-               break;
-            } else if (trackerRes[i].signal === "SHORT") {
-               break;
-            }
-          }
-
+        if (!isMarketOpen()) {
+           const nowStr = trackerRes[trackerRes.length - 1].date.split("T")[0];
+           for (let i = trackerRes.length - 1; i >= 0; i--) {
+              if (trackerRes[i].date.split("T")[0] !== nowStr) break;
+              if (trackerRes[i].signal === "LONG") {
+                 lastSignal = trackerRes[i];
+                 triggered = true;
+                 break;
+              } else if (trackerRes[i].signal === "SHORT") {
+                 break;
+              }
+           }
+        } else {
+           triggered = lastSignal && lastSignal.signal === "LONG";
+        }
         direction = "BULLISH";
         
         const niftyCandles = historicalDailyCandles["Nifty 50"] || [];
         const metrics = computeStockMetrics(stock.symbol, trackerCandles, niftyCandles);
         if (metrics) {
-          const strengthResult = calculateStrengthScore(metrics, "BULLISH");
+          const strengthResult = calculateStrengthScore(metrics);
           strengthScore = strengthResult.score;
         } else {
           strengthScore = 50;
@@ -2683,26 +3060,27 @@ async function forceRecalculateScanner(scannerId) {
         if (trackerRes.length === 0) continue;
         let lastSignal = trackerRes[trackerRes.length - 1];
         
-        
-          const nowIST = new Date(new Date().getTime() + 5.5 * 60 * 60 * 1000);
-    const nowStr = nowIST.toISOString().split("T")[0];
-          for (let i = trackerRes.length - 1; i >= 0; i--) {
-            if (trackerRes[i].date.split("T")[0] !== nowStr) break;
-            if (trackerRes[i].signal === "SHORT") {
-               lastSignal = trackerRes[i];
-               triggered = true;
-               break;
-            } else if (trackerRes[i].signal === "LONG") {
-               break;
-            }
-          }
-
+        if (!isMarketOpen()) {
+           const nowStr = trackerRes[trackerRes.length - 1].date.split("T")[0];
+           for (let i = trackerRes.length - 1; i >= 0; i--) {
+              if (trackerRes[i].date.split("T")[0] !== nowStr) break;
+              if (trackerRes[i].signal === "SHORT") {
+                 lastSignal = trackerRes[i];
+                 triggered = true;
+                 break;
+              } else if (trackerRes[i].signal === "LONG") {
+                 break;
+              }
+           }
+        } else {
+           triggered = lastSignal && lastSignal.signal === "SHORT";
+        }
         direction = "BEARISH";
         
         const niftyCandles = historicalDailyCandles["Nifty 50"] || [];
         const metrics = computeStockMetrics(stock.symbol, trackerCandles, niftyCandles);
         if (metrics) {
-          const strengthResult = calculateStrengthScore(metrics, "BEARISH");
+          const strengthResult = calculateStrengthScore(metrics);
           strengthScore = strengthResult.score;
         } else {
           strengthScore = 50;
@@ -2743,8 +3121,7 @@ async function forceRecalculateScanner(scannerId) {
         }
         trackerCandles = JSON.parse(JSON.stringify(trackerCandles));
         const lastCandle = trackerCandles[trackerCandles.length - 1];
-        const nowIST = new Date(new Date().getTime() + 5.5 * 60 * 60 * 1000);
-    const nowStr = nowIST.toISOString().split("T")[0];
+        const nowStr = dailyCandleStore.getIstTradingDate();
         if (liveData && lastCandle.date === nowStr) {
           lastCandle.close = ltp;
           lastCandle.high = Math.max(lastCandle.high, ltp);
@@ -2772,11 +3149,12 @@ async function forceRecalculateScanner(scannerId) {
         const niftyCandles = historicalDailyCandles["Nifty 50"] || [];
         const metrics = computeStockMetrics(stock.symbol, trackerCandles, niftyCandles);
         if (metrics) {
-          const strengthResult = calculateStrengthScore(metrics, "BEARISH");
+          const strengthResult = calculateStrengthScore(metrics);
           strengthScore = strengthResult.score;
         } else {
           strengthScore = trackerRes.summary.winRate || 50;
         }
+        if (lastSignal?.date) signalCandleTimestamp = lastSignal.date;
         break;
       }
       default:
@@ -2799,8 +3177,19 @@ async function forceRecalculateScanner(scannerId) {
           direction: direction,
           volumeScore: Math.round(volumeRatio * 40),
           trendScore: Math.round(rsiVal),
-          timestamp: new Date().toLocaleTimeString(),
-          triggerTime: new Date().toLocaleTimeString(),
+          timestamp: signalCandleTimestamp
+            ? new Date(signalCandleTimestamp).toLocaleString("en-IN", { timeZone: "Asia/Kolkata" })
+            : new Date().toLocaleTimeString(),
+          triggerTime: signalCandleTimestamp
+            ? (typeof signalCandleTimestamp === "string" && /^\d{4}-\d{2}-\d{2}$/.test(signalCandleTimestamp)
+              ? signalCandleTimestamp
+              : new Date(signalCandleTimestamp).toLocaleString("en-IN", { timeZone: "Asia/Kolkata" }))
+            : new Date().toISOString().split("T")[0],
+          triggerDate: signalCandleTimestamp
+            ? (typeof signalCandleTimestamp === "string" && /^\d{4}-\d{2}-\d{2}$/.test(signalCandleTimestamp)
+              ? new Date(`${signalCandleTimestamp}T00:00:00+05:30`)
+              : new Date(signalCandleTimestamp))
+            : new Date(),
           triggerPrice: ltp,
           postTriggerChange: 0,
           strengthScore: strengthScore,
@@ -3104,70 +3493,115 @@ function computeStockMetrics(symbol, candles, niftyCandles) {
   };
 }
 
-function calculateStrengthScore(stock, direction = "BULLISH") {
-    let trend = 0; let momentum = 0; let volume = 0; let relativeStrength = 0; let breakout = 0; let bonus = 0;
-    if (direction === "BULLISH") {
-      if (stock.ema20 > stock.ema50 && stock.ema50 > stock.ema200) trend += 10;
-      else if (stock.ema20 > stock.ema50) trend += 5;
-      const distanceFromEMA50 = ((stock.close - stock.ema50) / stock.ema50) * 100;
-      if (distanceFromEMA50 > 10) trend += 10; else if (distanceFromEMA50 > 5) trend += 7; else if (distanceFromEMA50 > 2) trend += 5; else if (distanceFromEMA50 > 0) trend += 2;
-      if (stock.weeklyClose > stock.weeklyEma20) trend += 5;
-      if (stock.weeklyEma20 > stock.weeklyEma50) trend += 5;
-    } else {
-      if (stock.ema20 < stock.ema50 && stock.ema50 < stock.ema200) trend += 10;
-      else if (stock.ema20 < stock.ema50) trend += 5;
-      const distanceFromEMA50 = ((stock.ema50 - stock.close) / stock.ema50) * 100;
-      if (distanceFromEMA50 > 10) trend += 10; else if (distanceFromEMA50 > 5) trend += 7; else if (distanceFromEMA50 > 2) trend += 5; else if (distanceFromEMA50 > 0) trend += 2;
-      if (stock.weeklyClose < stock.weeklyEma20) trend += 5;
-      if (stock.weeklyEma20 < stock.weeklyEma50) trend += 5;
+function calculateStrengthScore(stock) {
+  let trend = 0;
+  let momentum = 0;
+  let volume = 0;
+  let relativeStrength = 0;
+  let breakout = 0;
+  let bonus = 0;
+
+  // =====================
+  // TREND (30)
+  // =====================
+  if (stock.ema20 > stock.ema50 && stock.ema50 > stock.ema200) {
+    trend += 10;
+  } else if (stock.ema20 > stock.ema50) {
+    trend += 5;
+  }
+
+  const distanceFromEMA50 = ((stock.close - stock.ema50) / stock.ema50) * 100;
+  if (distanceFromEMA50 > 10) trend += 10;
+  else if (distanceFromEMA50 > 5) trend += 7;
+  else if (distanceFromEMA50 > 2) trend += 5;
+  else trend += 2;
+
+  if (stock.weeklyClose > stock.weeklyEma20) trend += 5;
+  if (stock.weeklyEma20 > stock.weeklyEma50) trend += 5;
+
+  // =====================
+  // MOMENTUM (25)
+  // =====================
+  if (stock.rsi >= 65 && stock.rsi <= 80) momentum += 10;
+  else if (stock.rsi >= 60) momentum += 7;
+  else if (stock.rsi >= 55) momentum += 5;
+
+  if (stock.rsi > stock.prevRsi) momentum += 5;
+  if (stock.macdHistogram > 0) momentum += 5;
+  if (stock.macdHistogram > stock.prevMacdHistogram) momentum += 5;
+
+  // =====================
+  // VOLUME (20)
+  // =====================
+  const relativeVolume = stock.volume / stock.avgVolume20;
+  if (relativeVolume > 2) volume += 10;
+  else if (relativeVolume > 1.5) volume += 7;
+  else if (relativeVolume > 1.2) volume += 5;
+
+  if (stock.deliveryPercent > 60) volume += 5;
+  else if (stock.deliveryPercent > 50) volume += 3;
+
+  if (stock.volume > stock.highestVolume10) {
+    volume += 5;
+  }
+
+  // =====================
+  // RELATIVE STRENGTH (15)
+  // =====================
+  const rs = stock.stockReturn20D - stock.niftyReturn20D;
+  if (rs > 15) relativeStrength += 10;
+  else if (rs > 10) relativeStrength += 8;
+  else if (rs > 5) relativeStrength += 5;
+
+  if (stock.distanceFrom52WeekHigh <= 5) {
+    relativeStrength += 5;
+  }
+
+  // =====================
+  // BREAKOUT (10)
+  // =====================
+  if (stock.breakout20Day || stock.breakout50Day || stock.breakoutSwingHigh) {
+    breakout += 5;
+  }
+
+  const candleRange = stock.high - stock.low;
+  let bodyPercent = 0;
+  if (candleRange > 0) {
+    bodyPercent = (Math.abs(stock.close - stock.open) / candleRange) * 100;
+    if (bodyPercent > 70) breakout += 5;
+    else if (bodyPercent > 50) breakout += 3;
+  }
+
+  // =====================
+  // BONUS
+  // =====================
+  if ((stock.adx ?? 0) > 25) bonus += 5;
+  if ((stock.mfi ?? 0) > 60) bonus += 5;
+  if ((stock.weeklyRsi ?? 0) > 60) bonus += 5;
+  if (stock.sectorOutperforming) bonus += 5;
+
+  let score = trend + momentum + volume + relativeStrength + breakout + bonus;
+
+  // =====================
+  // PENALTIES
+  // =====================
+  if (bodyPercent < 20) score -= 10;
+  if (stock.rsi > 85) score -= 5;
+  if (stock.close < stock.prevLow) score -= 10;
+  if (stock.open > stock.prevClose * 1.08) score -= 5;
+  if (stock.volume < stock.avgVolume20) score -= 5;
+
+  return {
+    score,
+    breakdown: {
+      trend,
+      momentum,
+      volume,
+      relativeStrength,
+      breakout,
+      bonus
     }
-    if (direction === "BULLISH") {
-      if (stock.rsi >= 65 && stock.rsi <= 80) momentum += 10; else if (stock.rsi >= 60) momentum += 7; else if (stock.rsi >= 55) momentum += 5;
-      if (stock.rsi > stock.prevRsi) momentum += 5;
-      if (stock.macdHistogram > 0) momentum += 5;
-      if (stock.macdHistogram > stock.prevMacdHistogram) momentum += 5;
-    } else {
-      if (stock.rsi <= 35 && stock.rsi >= 20) momentum += 10; else if (stock.rsi <= 40) momentum += 7; else if (stock.rsi <= 45) momentum += 5;
-      if (stock.rsi < stock.prevRsi) momentum += 5;
-      if (stock.macdHistogram < 0) momentum += 5;
-      if (stock.macdHistogram < stock.prevMacdHistogram) momentum += 5;
-    }
-    const relativeVolume = stock.volume / stock.avgVolume20;
-    if (relativeVolume > 2) volume += 10; else if (relativeVolume > 1.5) volume += 7; else if (relativeVolume > 1.2) volume += 5;
-    if (stock.deliveryPercent > 60) volume += 5; else if (stock.deliveryPercent > 50) volume += 3;
-    if (stock.volume > stock.highestVolume10) volume += 5;
-    const rs = stock.stockReturn20D - stock.niftyReturn20D;
-    if (direction === "BULLISH") {
-      if (rs > 15) relativeStrength += 10; else if (rs > 10) relativeStrength += 8; else if (rs > 5) relativeStrength += 5;
-      if (stock.distanceFrom52WeekHigh <= 5) relativeStrength += 5;
-    } else {
-      if (rs < -15) relativeStrength += 10; else if (rs < -10) relativeStrength += 8; else if (rs < -5) relativeStrength += 5;
-      if (stock.distanceFrom52WeekLow <= 5) relativeStrength += 5;
-    }
-    if (stock.breakout20Day || stock.breakout50Day || stock.breakoutSwingHigh) breakout += 5;
-    const candleRange = stock.high - stock.low;
-    let bodyPercent = 0;
-    if (candleRange > 0) {
-      bodyPercent = (Math.abs(stock.close - stock.open) / candleRange) * 100;
-      if (bodyPercent > 70) breakout += 5; else if (bodyPercent > 50) breakout += 3;
-    }
-    if ((stock.adx ?? 0) > 25) bonus += 5;
-    if (direction === "BULLISH" && (stock.mfi ?? 0) > 60) bonus += 5;
-    if (direction === "BEARISH" && (stock.mfi ?? 0) < 40) bonus += 5;
-    if (direction === "BULLISH" && (stock.weeklyRsi ?? 0) > 60) bonus += 5;
-    if (direction === "BEARISH" && (stock.weeklyRsi ?? 0) < 40) bonus += 5;
-    if (direction === "BULLISH" && stock.sectorOutperforming) bonus += 5;
-    if (direction === "BEARISH" && !stock.sectorOutperforming) bonus += 5;
-    let score = trend + momentum + volume + relativeStrength + breakout + bonus;
-    if (bodyPercent < 20) score -= 10;
-    if (direction === "BULLISH" && stock.rsi > 85) score -= 5;
-    if (direction === "BEARISH" && stock.rsi < 15) score -= 5;
-    if (direction === "BULLISH" && stock.close < stock.prevLow) score -= 10;
-    if (direction === "BEARISH" && stock.close > stock.prevHigh) score -= 10;
-    if (direction === "BULLISH" && stock.open > stock.prevClose * 1.08) score -= 5;
-    if (direction === "BEARISH" && stock.open < stock.prevClose * 0.92) score -= 5;
-    if (stock.volume < stock.avgVolume20) score -= 5;
-    return { score, breakdown: { trend, momentum, volume, relativeStrength, breakout, bonus } };
+  };
 }
 
 function getNseEqUniverse() {
@@ -3185,9 +3619,12 @@ function getNseEqUniverse() {
 }
 
 module.exports = {
+  dynamicallyAddSwingStock,
   startScannerEngine,
   stopScannerEngine,
   forceRecalculateScanner,
+  regenerateScannerFromMongo,
+  applyRegeneratedDashboardSignals,
   runEodSwingScan,
   getHistoricalDailyCandles,
   getHistoricalIntradayCandles,

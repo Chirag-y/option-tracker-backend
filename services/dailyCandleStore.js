@@ -62,6 +62,21 @@ async function loadSeries(symbol) {
   }
 }
 
+/** Load daily candles for a specific symbol list (boot-safe — avoids loading entire DB). */
+async function loadSymbols(symbols) {
+  const result = {};
+  if (!mongoReady() || !Array.isArray(symbols) || symbols.length === 0) return result;
+  const BATCH = 50;
+  for (let i = 0; i < symbols.length; i += BATCH) {
+    const batch = symbols.slice(i, i + BATCH);
+    await Promise.all(batch.map(async (symbol) => {
+      const series = await loadSeries(symbol);
+      if (series.length > 0) result[symbol] = series;
+    }));
+  }
+  return result;
+}
+
 /** Bulk-load all daily candles into an in-memory map keyed by symbol. */
 async function loadAll() {
   const result = {};
@@ -200,6 +215,7 @@ async function isEodScanCompleteForToday() {
 
 module.exports = {
   loadSeries,
+  loadSymbols,
   loadAll,
   upsertCandles,
   getLastCandleDate,

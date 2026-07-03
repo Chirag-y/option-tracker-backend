@@ -252,33 +252,58 @@ function handleIncomingTick(tick) {
   const baseSymbol = symbol.endsWith("-EQ") ? symbol.slice(0, -3) : symbol;
 
   const ltp        = Number(tick.last_traded_price || 0) / 100;
-  const openPrice  = Number(tick.open_price_day || tick.open || tick.close_price || 0) / 100;
-  const closePrice = Number(tick.close_price || tick.open_price_day || 0) / 100;
+  const openPrice  = Number(tick.open_price_day || tick.open || 0) / 100;
+  const closePrice = Number(tick.close_price || 0) / 100;
   const volume     = Number(tick.vol_traded || tick.volume || 0);
 
-  let changePercent = 0;
-  const ref = closePrice > 0 ? closePrice : openPrice;
-  if (ref > 0) changePercent = ((ltp - ref) / ref) * 100;
-  changePercent = Number(changePercent.toFixed(2));
+  const existing = tickCache[symbol] || tickCache[baseSymbol] || {};
+  const storedPrevClose = Number(existing.prevDayClose || existing.close || 0);
 
-  let absoluteChange = 0; if (ref > 0) absoluteChange = Number((ltp - ref).toFixed(2)); const snapshot = { change: absoluteChange,
+  // Preserve previous-day close from REST seed; tick close_price is prev close when non-zero.
+  let prevDayClose = storedPrevClose;
+  if (closePrice > 0 && (storedPrevClose <= 0 || Math.abs(closePrice - ltp) > 0.01)) {
+    prevDayClose = closePrice;
+  } else if (prevDayClose <= 0 && closePrice > 0) {
+    prevDayClose = closePrice;
+  }
+  if (prevDayClose <= 0 && openPrice > 0) prevDayClose = openPrice;
+
+  let changePercent = 0;
+  let absoluteChange = 0;
+  if (prevDayClose > 0) {
+    changePercent = ((ltp - prevDayClose) / prevDayClose) * 100;
+    absoluteChange = ltp - prevDayClose;
+  }
+  changePercent = Number(changePercent.toFixed(2));
+  absoluteChange = Number(absoluteChange.toFixed(2));
+
+  const snapshot = {
+    change: absoluteChange,
     ltp, volume, changePercent,
     timestamp: new Date().toLocaleTimeString(),
     token: tick.token,
     segment: instrument.segment,
     price: ltp,
-    close: closePrice || ref || undefined,
+    close: prevDayClose,
+    prevDayClose,
   };
-  tickCache[symbol]     = snapshot;
-  tickCache[baseSymbol] = snapshot;
+  tickCache[symbol]     = { ...existing, ...snapshot };
+  tickCache[baseSymbol] = { ...(tickCache[baseSymbol] || existing), ...snapshot };
+
+  let broadcastSym = baseSymbol;
+  if (symbol === "Nifty 50") broadcastSym = "NIFTY";
+  else if (symbol === "Nifty Bank") broadcastSym = "BANKNIFTY";
+  else if (symbol === "SENSEX") broadcastSym = "SENSEX";
+
+  const broadcastExtras = { change: absoluteChange, prevClose: prevDayClose };
 
   // -------- Broadcast-on-change (Phase 1) --------
-  if (_shouldBroadcast(baseSymbol, ltp, changePercent)) {
-    lastBroadcast.set(baseSymbol, { ltp, changePercent });
-    broadcastPriceUpdate(baseSymbol, ltp, changePercent);
-    if (baseSymbol !== symbol) {
+  if (_shouldBroadcast(broadcastSym, ltp, changePercent)) {
+    lastBroadcast.set(broadcastSym, { ltp, changePercent });
+    broadcastPriceUpdate(broadcastSym, ltp, changePercent, broadcastExtras);
+    if (broadcastSym !== symbol && broadcastSym !== baseSymbol) {
       lastBroadcast.set(symbol, { ltp, changePercent });
-      broadcastPriceUpdate(symbol, ltp, changePercent);
+      broadcastPriceUpdate(symbol, ltp, changePercent, broadcastExtras);
     }
   }
 }

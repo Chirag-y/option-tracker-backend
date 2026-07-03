@@ -24,6 +24,7 @@ const candleCache     = require("./candleCacheManager");
 const { getTickCache } = require("./marketDataFeed");
 const alertManager    = require("./alertManager");
 const indicatorCache  = require("./indicatorCache");
+const { broadcastScannerUpdate } = require("./socketServer");
 
 const SCANNER_ID = "commodity-momentum";
 
@@ -34,6 +35,9 @@ function _highOverWindow(candles, n) {
 }
 
 async function run() {
+  const { isCommodityFeedPaused } = require("./commodityFeedControl");
+  if (isCommodityFeedPaused()) return [];
+
   const universe = await getActiveCommodityUniverse();
   if (!universe || universe.length === 0) return [];
 
@@ -101,6 +105,10 @@ async function run() {
     // Centralised dispatch — alertManager handles dedup + socket + push.
     alertManager.dispatch({ scannerId: SCANNER_ID, signalInfo: signal });
   }
+
+  try { broadcastScannerUpdate(SCANNER_ID, out); }
+  catch (e) { console.error("[CommodityScanner] broadcast failed:", e.message); }
+
   return out;
 }
 

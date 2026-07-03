@@ -1,8 +1,52 @@
 const router = require("express").Router();
 const User = require("../models/User");
+const PasswordResetRequest = require("../models/PasswordResetRequest");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const auth = require("../middlewares/auth.middleware");
+const { sendPushToUsers } = require("../utils/onesignal");
+
+const ADMIN_EMAIL = "cyadav591@gmail.com";
+
+const serializeAuthUser = (user, normalizedEmail) => {
+  const isAdmin = normalizedEmail === ADMIN_EMAIL;
+  const isTeamApproved = user.isTeamApproved !== false;
+  return {
+    id: user._id,
+    name: user.name,
+    email: user.email,
+    teamCode: user.teamCode,
+    isAdmin,
+    isVerified: user.isVerified,
+    isTeamApproved,
+    teamApprovalState: user.teamApprovalState || (isTeamApproved ? "APPROVED" : "PENDING"),
+    mustChangePassword: Boolean(user.mustChangePassword),
+    pnlMode: user.pnlMode,
+    pnlEligibleFrom: user.pnlEligibleFrom,
+    investedAmount: user.investedAmount,
+    sharePercentage: user.sharePercentage,
+    currentBalance: user.currentBalance,
+    tradeResultNotificationsEnabled: user.tradeResultNotificationsEnabled,
+    intradayStockAlertsEnabled: user.intradayStockAlertsEnabled,
+    cockpitCardOrder: user.cockpitCardOrder || []
+  };
+};
+
+const notifyAdminPasswordReset = async (request, userName) => {
+  try {
+    const admin = await User.findOne({ email: ADMIN_EMAIL }).select("_id");
+    if (!admin) return;
+    await sendPushToUsers({
+      recipientIds: [String(admin._id)],
+      name: "password_reset_request",
+      headings: { en: "Password reset requested" },
+      contents: { en: `${userName} (${request.email}) requested a password reset for team ${request.teamCode}.` },
+      data: { type: "PASSWORD_RESET_REQUEST", requestId: String(request._id) }
+    });
+  } catch (err) {
+    console.error("[Auth] Failed to notify admin of password reset:", err.message);
+  }
+};
 
 router.post("/register", async (req, res) => {
   try {
@@ -86,27 +130,41 @@ router.post("/login", async (req, res) => {
     );
     res.json({
       token,
-      user: {
-        id: user._id,
-        name: user.name,
-        email: user.email,
-        teamCode: user.teamCode,
-        isAdmin,
-        isVerified: user.isVerified,
-        isTeamApproved,
-        teamApprovalState: user.teamApprovalState || (isTeamApproved ? "APPROVED" : "PENDING"),
-        pnlMode: user.pnlMode,
-        pnlEligibleFrom: user.pnlEligibleFrom,
-        investedAmount: user.investedAmount,
-        sharePercentage: user.sharePercentage,
-        currentBalance: user.currentBalance,
-        tradeResultNotificationsEnabled: user.tradeResultNotificationsEnabled,
-        intradayStockAlertsEnabled: user.intradayStockAlertsEnabled,
-        cockpitCardOrder: user.cockpitCardOrder || []
-      }
+      user: serializeAuthUser(user, normalizedEmail)
     });
   } catch (err) {
     res.status(500).json({ message: "Failed to login" });
+  }
+});
+
+router.post("/forgot-password", async (req, res) => {
+  try {
+    const { email, teamCode } = req.body;
+    if (!email || !teamCode) {
+      return res.status(400).json({ message: "email and teamCode are required" });
+    }
+
+    const normalizedEmail = String(email).toLowerCase().trim();
+    const normalizedTeamCode = String(teamCode).trim().toUpperCase();
+    const user = await User.findOne({ email: normalizedEmail, teamCode: normalizedTeamCode });
+
+    if (user) {
+      let request = await PasswordResetRequest.findOne({ userId: user._id, status: "PENDING" });
+      if (!request) {
+        request = await PasswordResetRequest.create({
+          userId: user._id,
+          email: normalizedEmail,
+          teamCode: normalizedTeamCode
+        });
+      }
+      await notifyAdminPasswordReset(request, user.name);
+    }
+
+    res.json({
+      message: "If your account exists, a password reset request was sent to the admin. You will receive a temporary password to log in, then you must set a new password."
+    });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to submit password reset request" });
   }
 });
 

@@ -10,6 +10,14 @@ router.post("/swing-tracker-scan", scannerController.scanSwingTracker);
 
 // Commodities route
 router.get("/commodities", scannerController.getCommodities);
+router.get("/commodities/feed-status", scannerController.getCommodityFeedStatus);
+router.patch("/commodities/feed", scannerController.setCommodityFeedPaused);
+
+// Custom options (must be before /:id routes)
+router.get("/custom-options/strikes", scannerController.getCustomOptionsStrikes);
+router.get("/custom-options/preferences", scannerController.getCustomOptionsPreferences);
+router.get("/custom-options", scannerController.getCustomOptions);
+router.post("/custom-options/fetch-historical", scannerController.fetchCustomOptionsHistorical);
 
 // Backtesting endpoint
 router.get("/:id/backtest", scannerController.getBacktest);

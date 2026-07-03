@@ -35,15 +35,20 @@ function initSocketServer(httpServer) {
   });
 
   ioInstance.use((socket, next) => {
+    const token = socket.handshake.auth?.token;
+    if (!token) {
+      socket.user = { id: null, name: "Guest" };
+      return next();
+    }
     try {
-      const token = socket.handshake.auth?.token;
-      if (!token) return next(new Error("Authentication error: Token is missing."));
       const decoded = jwt.verify(token, process.env.JWT_SECRET);
       socket.user = decoded;
-      next();
+      return next();
     } catch (err) {
-      console.warn(`[Socket] Auth failed for socket ${socket.id}:`, err.message);
-      return next(new Error("Authentication error: Invalid Token."));
+      // Expired/invalid tokens still receive read-only market data (dashboard screener).
+      console.warn(`[Socket] Invalid/expired token for ${socket.id}, allowing read-only:`, err.message);
+      socket.user = { id: null, name: "Guest", tokenExpired: true };
+      return next();
     }
   });
 
@@ -72,9 +77,15 @@ function initSocketServer(httpServer) {
   return ioInstance;
 }
 
-function broadcastPriceUpdate(symbol, price, changePercent) {
+function broadcastPriceUpdate(symbol, price, changePercent, extras = {}) {
   if (!ioInstance) return;
-  ioInstance.emit("price-update", { symbol, price, changePercent });
+  ioInstance.emit("price-update", {
+    symbol,
+    price,
+    changePercent,
+    change: extras.change,
+    prevClose: extras.prevClose,
+  });
 }
 
 /**

@@ -164,7 +164,32 @@ async function runBacktest(scannerId, periodDays = 60) {
   let cachedCandles = null;
   if (isSwingScanner) {
     try {
-      cachedCandles = getHistoricalDailyCandles();
+      const dailyCandleStore = require("./dailyCandleStore");
+      const FO_UNIVERSE = require("../config/foUniverse");
+      cachedCandles = { ...(getHistoricalDailyCandles() || {}) };
+
+      // Boot fast-path may leave only index candles in RAM — load Mongo series for
+      // every symbol we need to backtest (SwingCandidate triggers + F&O universe).
+      const queryCutoff = new Date();
+      queryCutoff.setDate(queryCutoff.getDate() - periodDays);
+      const swingCandidates = await SwingCandidate.find(
+        { triggerDate: { $gte: queryCutoff } },
+        { symbol: 1 }
+      ).lean();
+
+      const symbolsToEnsure = new Set(["Nifty 50", "Nifty Bank", "SENSEX"]);
+      for (const s of FO_UNIVERSE) if (s?.symbol) symbolsToEnsure.add(s.symbol);
+      for (const c of swingCandidates) if (c?.symbol) symbolsToEnsure.add(c.symbol);
+
+      const missing = [...symbolsToEnsure].filter(sym => {
+        const series = cachedCandles[sym];
+        return !series || series.length < 15;
+      });
+
+      if (missing.length > 0) {
+        const loaded = await dailyCandleStore.loadSymbols(missing);
+        cachedCandles = { ...cachedCandles, ...loaded };
+      }
     } catch (err) {
       console.warn("[BacktestEngine] Failed to get historical daily candles:", err.message);
     }
@@ -202,17 +227,61 @@ async function runBacktest(scannerId, periodDays = 60) {
             { symbol: 1 }
           ).lean();
           const activeSymbols = new Set(activeCandidates.map(c => c.symbol));
-          targetTestStocks = universe.filter(stock => activeSymbols.has(stock.symbol));
+          if (activeSymbols.size > 0) {
+            targetTestStocks = Array.from(activeSymbols).map(sym => ({
+              symbol: sym,
+              name: sym,
+              isFO: false
+            }));
+          } else if (universe.length > 0) {
+            targetTestStocks = universe;
+          } else {
+            targetTestStocks = Object.keys(cachedCandles).map(sym => ({
+              symbol: sym,
+              name: sym,
+              isFO: false
+            }));
+          }
         } catch (err) {
           console.warn("[BacktestEngine] Failed to filter by SwingCandidate Mongo data:", err.message);
           targetTestStocks = universe;
         }
       }
     } else {
-      targetTestStocks = Object.keys(cachedCandles).map(sym => {
-        const found = testStocks.find(s => s.symbol === sym);
-        return { symbol: sym, name: found ? found.name : sym, isFO: found ? found.isFO : false };
-      });
+      if (isSwingScanner) {
+        try {
+          const queryCutoff = new Date();
+          queryCutoff.setDate(queryCutoff.getDate() - periodDays);
+          const activeCandidates = await SwingCandidate.find(
+            { triggerDate: { $gte: queryCutoff } },
+            { symbol: 1 }
+          ).lean();
+          const activeSymbols = new Set(activeCandidates.map(c => c.symbol));
+          if (activeSymbols.size > 0) {
+            targetTestStocks = Array.from(activeSymbols).map(sym => ({
+              symbol: sym,
+              name: sym,
+              isFO: false
+            }));
+          } else {
+            targetTestStocks = Object.keys(cachedCandles).map(sym => {
+              const found = testStocks.find(s => s.symbol === sym);
+              return { symbol: sym, name: found ? found.name : sym, isFO: found ? found.isFO : false };
+            });
+          }
+        } catch (err) {
+          console.warn("[BacktestEngine] Failed to filter by SwingCandidate Mongo data:", err.message);
+          targetTestStocks = Object.keys(cachedCandles).map(sym => {
+            const found = testStocks.find(s => s.symbol === sym);
+            return { symbol: sym, name: found ? found.name : sym, isFO: found ? found.isFO : false };
+          });
+        }
+      } else {
+        targetTestStocks = Object.keys(cachedCandles).map(sym => {
+          const found = testStocks.find(s => s.symbol === sym);
+          return { symbol: sym, name: found ? found.name : sym, isFO: found ? found.isFO : false };
+        });
+      }
       if (isFoScanner) {
         targetTestStocks = targetTestStocks.filter(stock => stock.isFO === true);
       }
@@ -245,171 +314,146 @@ async function runBacktest(scannerId, periodDays = 60) {
 
       if (signals.length === 0) return;
 
-      // Retrieve only the latest signal
-      const latestSignal = signals[signals.length - 1];
-
-      // For fo-bearish, a SELL signal is the bullish indicator for entry, but wait, let's keep it simple:
-      // swing tracker buys on BUY and sells on SELL.
-      // If we are looking for a bearish trade (shorts), the entry is SELL (SHORT) and exit is BUY (LONG).
-      // Let's adjust entry/exit roles if we are in fo-bearish, so we can track short PnL correctly!
       const isBearishScanner = scannerId === "fo-bearish";
       const entryAction = isBearishScanner ? "SELL" : "BUY";
       const exitAction = isBearishScanner ? "BUY" : "SELL";
 
-      if (latestSignal.action === entryAction) {
-        const entryDate = latestSignal.date;
+      // Iterate through all signals to find all trades within the cutoff window
+      let currentTrade = null;
 
-        // Filter Open Trades by date cutoff
-        if (entryDate >= cutoffStr) {
-          const entryPrice = latestSignal.price;
+      for (let i = 0; i < signals.length; i++) {
+        const sig = signals[i];
 
-          // Find recent swing high/low over last 20 candles preceding the entry
-          let extremePrice = entryPrice;
-          const entryCandleIdx = allStockCandles.findIndex(c => c.date === entryDate);
-          if (entryCandleIdx !== -1) {
-            const startLookback = Math.max(0, entryCandleIdx - 20);
-            for (let cIdx = startLookback; cIdx < entryCandleIdx; cIdx++) {
-              if (isBearishScanner) {
-                // For shorts, stop loss is near swing high, target is below
-                if (allStockCandles[cIdx].high > extremePrice) {
-                  extremePrice = allStockCandles[cIdx].high;
-                }
-              } else {
-                // For longs, target is near swing high, stop loss is below
-                if (allStockCandles[cIdx].high > extremePrice) {
-                  extremePrice = allStockCandles[cIdx].high;
+        if (!currentTrade && sig.action === entryAction) {
+          // Open new trade
+          currentTrade = {
+            entryDate: sig.date,
+            entryPrice: sig.price,
+            ribbonBullishCount: sig.ribbonBullishCount
+          };
+        } else if (currentTrade && sig.action === exitAction) {
+          // Close trade
+          const entryDate = currentTrade.entryDate;
+          const entryPrice = currentTrade.entryPrice;
+          const exitDate = sig.date;
+          const exitPrice = sig.price;
+
+          if (exitDate >= cutoffStr || entryDate >= cutoffStr) {
+            // Find extreme price for target/SL
+            let extremePrice = entryPrice;
+            const entryCandleIdx = allStockCandles.findIndex(c => c.date === entryDate);
+            if (entryCandleIdx !== -1) {
+              const startLookback = Math.max(0, entryCandleIdx - 20);
+              for (let cIdx = startLookback; cIdx < entryCandleIdx; cIdx++) {
+                if (allStockCandles[cIdx].high > extremePrice) extremePrice = allStockCandles[cIdx].high;
+              }
+            }
+
+            let targetPrice = isBearishScanner ? entryPrice * 0.90 : (extremePrice > entryPrice * 1.04 ? extremePrice : entryPrice * 1.10);
+            let stopLossPrice = isBearishScanner ? (extremePrice > entryPrice * 1.04 ? extremePrice : entryPrice * 1.06) : entryPrice * 0.94;
+
+            const pnlPct = isBearishScanner ? ((entryPrice - exitPrice) / entryPrice) * 100 : ((exitPrice - entryPrice) / entryPrice) * 100;
+            const pnlAmt = isBearishScanner ? entryPrice - exitPrice : exitPrice - entryPrice;
+            const success = pnlPct >= 0;
+
+            const strInfo = getSignalStrengthInfo(allStockCandles, entryDate, currentTrade.ribbonBullishCount);
+
+            let runExtreme = entryPrice;
+            const exitCandleIdx = allStockCandles.findIndex(c => c.date === exitDate);
+            if (entryCandleIdx !== -1 && exitCandleIdx !== -1) {
+              for (let cIdx = entryCandleIdx; cIdx <= exitCandleIdx; cIdx++) {
+                if (isBearishScanner) {
+                  if (allStockCandles[cIdx].low < runExtreme) runExtreme = allStockCandles[cIdx].low;
+                } else {
+                  if (allStockCandles[cIdx].high > runExtreme) runExtreme = allStockCandles[cIdx].high;
                 }
               }
             }
-          }
 
-          let targetPrice = isBearishScanner ? entryPrice * 0.90 : (extremePrice > entryPrice * 1.04 ? extremePrice : entryPrice * 1.10);
-          let stopLossPrice = isBearishScanner ? (extremePrice > entryPrice * 1.04 ? extremePrice : entryPrice * 1.06) : entryPrice * 0.94;
-
-          const latestCandle = allStockCandles[allStockCandles.length - 1];
-          const currentPrice = latestCandle.close;
-          const pnlPct = isBearishScanner ? ((entryPrice - currentPrice) / entryPrice) * 100 : ((currentPrice - entryPrice) / entryPrice) * 100;
-          const pnlAmt = isBearishScanner ? entryPrice - currentPrice : currentPrice - entryPrice;
-
-          const strInfo = getSignalStrengthInfo(allStockCandles, entryDate, latestSignal.ribbonBullishCount);
-
-          trades.push({
-            id: `t_open_${stock.symbol}_${entryDate}`,
-            symbol: stock.symbol,
-            name: stock.name,
-            type: isBearishScanner ? "SELL" : "BUY",
-            entryDate,
-            entryPrice: Number(entryPrice.toFixed(2)),
-            exitDate: "—",
-            exitPrice: null,
-            currentPrice: Number(currentPrice.toFixed(2)),
-            targetPrice: Number(targetPrice.toFixed(2)),
-            stopLossPrice: Number(stopLossPrice.toFixed(2)),
-            pnlAmount: Number(pnlAmt.toFixed(2)),
-            pnlPct: Number(pnlPct.toFixed(2)),
-            status: "OPEN",
-            potentialBuyZone: "—",
-            signalStrength: strInfo.strength
-          });
-        }
-      } else if (latestSignal.action === exitAction) {
-        const exitDate = latestSignal.date;
-
-        if (exitDate >= cutoffStr) {
-          const exitPrice = latestSignal.price;
-
-          // Find preceding entry signal
-          let prevEntrySignal = null;
-          for (let i = signals.length - 2; i >= 0; i--) {
-            if (signals[i].action === entryAction) {
-              prevEntrySignal = signals[i];
-              break;
-            }
-          }
-
-          if (!prevEntrySignal) return;
-
-          const entryPrice = prevEntrySignal.price;
-          const entryDate = prevEntrySignal.date;
-
-          // Target/Stop Loss calculations
-          let extremePrice = entryPrice;
-          const entryCandleIdx = allStockCandles.findIndex(c => c.date === entryDate);
-          if (entryCandleIdx !== -1) {
-            const startLookback = Math.max(0, entryCandleIdx - 20);
-            for (let cIdx = startLookback; cIdx < entryCandleIdx; cIdx++) {
-              if (allStockCandles[cIdx].high > extremePrice) {
-                extremePrice = allStockCandles[cIdx].high;
-              }
-            }
-          }
-          let targetPrice = isBearishScanner ? entryPrice * 0.90 : (extremePrice > entryPrice * 1.04 ? extremePrice : entryPrice * 1.10);
-          let stopLossPrice = isBearishScanner ? (extremePrice > entryPrice * 1.04 ? extremePrice : entryPrice * 1.06) : entryPrice * 0.94;
-
-          const pnlPct = isBearishScanner ? ((entryPrice - exitPrice) / entryPrice) * 100 : ((exitPrice - entryPrice) / entryPrice) * 100;
-          const pnlAmt = isBearishScanner ? entryPrice - exitPrice : exitPrice - entryPrice;
-          const success = pnlPct >= 0;
-
-          const strInfo = getSignalStrengthInfo(allStockCandles, entryDate, prevEntrySignal.ribbonBullishCount);
-
-          // Calculate swing high/low reached between entryDate and exitDate for potential buy/sell zone calculation
-          let runExtreme = entryPrice;
-          const exitCandleIdx = allStockCandles.findIndex(c => c.date === exitDate);
-          if (entryCandleIdx !== -1 && exitCandleIdx !== -1) {
-            for (let cIdx = entryCandleIdx; cIdx <= exitCandleIdx; cIdx++) {
-              if (isBearishScanner) {
-                if (allStockCandles[cIdx].low < runExtreme) {
-                  runExtreme = allStockCandles[cIdx].low;
-                }
-              } else {
-                if (allStockCandles[cIdx].high > runExtreme) {
-                  runExtreme = allStockCandles[cIdx].high;
-                }
-              }
-            }
-          }
-
-          let potentialBuyZone = "";
-          if (isBearishScanner) {
-            potentialBuyZone = `₹${(exitPrice * 1.04).toFixed(2)} - ₹${(exitPrice * 1.07).toFixed(2)}`;
-          } else {
-            if (runExtreme > entryPrice * 1.02) {
-              const diff = runExtreme - entryPrice;
-              const buyZoneMax = runExtreme - 0.50 * diff;
-              const buyZoneMin = runExtreme - 0.618 * diff;
-              potentialBuyZone = `₹${buyZoneMin.toFixed(2)} - ₹${buyZoneMax.toFixed(2)}`;
+            let potentialBuyZone = "";
+            if (isBearishScanner) {
+              potentialBuyZone = `₹${(exitPrice * 1.04).toFixed(2)} - ₹${(exitPrice * 1.07).toFixed(2)}`;
             } else {
-              potentialBuyZone = `₹${(exitPrice * 0.93).toFixed(2)} - ₹${(exitPrice * 0.96).toFixed(2)}`;
+              if (runExtreme > entryPrice * 1.02) {
+                const diff = runExtreme - entryPrice;
+                const buyZoneMax = runExtreme - 0.50 * diff;
+                const buyZoneMin = runExtreme - 0.618 * diff;
+                potentialBuyZone = `₹${buyZoneMin.toFixed(2)} - ₹${buyZoneMax.toFixed(2)}`;
+              } else {
+                potentialBuyZone = `₹${(exitPrice * 0.93).toFixed(2)} - ₹${(exitPrice * 0.96).toFixed(2)}`;
+              }
             }
+
+            totalTrades++;
+            if (success) winningTrades++;
+            else losingTrades++;
+            totalProfitPct += pnlPct;
+
+            trades.push({
+              id: `t_closed_${stock.symbol}_${exitDate}`,
+              symbol: stock.symbol,
+              name: stock.name,
+              type: isBearishScanner ? "SELL" : "BUY",
+              entryDate,
+              entryPrice: Number(entryPrice.toFixed(2)),
+              exitDate,
+              exitPrice: Number(exitPrice.toFixed(2)),
+              currentPrice: Number(exitPrice.toFixed(2)),
+              targetPrice: Number(targetPrice.toFixed(2)),
+              stopLossPrice: Number(stopLossPrice.toFixed(2)),
+              pnlAmount: Number(pnlAmt.toFixed(2)),
+              pnlPct: Number(pnlPct.toFixed(2)),
+              status: success ? "PROFIT" : "LOSS",
+              potentialBuyZone,
+              signalStrength: strInfo.strength
+            });
           }
-
-          totalTrades++;
-          if (success) winningTrades++;
-          else losingTrades++;
-          totalProfitPct += pnlPct;
-
-          const latestCandle = allStockCandles[allStockCandles.length - 1];
-          const currentPrice = latestCandle ? latestCandle.close : exitPrice;
-
-          trades.push({
-            id: `t_closed_${stock.symbol}_${exitDate}`,
-            symbol: stock.symbol,
-            name: stock.name,
-            type: isBearishScanner ? "BUY" : "SELL",
-            entryDate,
-            entryPrice: Number(entryPrice.toFixed(2)),
-            exitDate,
-            exitPrice: Number(exitPrice.toFixed(2)),
-            currentPrice: Number(currentPrice.toFixed(2)),
-            targetPrice: Number(targetPrice.toFixed(2)),
-            stopLossPrice: Number(stopLossPrice.toFixed(2)),
-            pnlAmount: Number(pnlAmt.toFixed(2)),
-            pnlPct: Number(pnlPct.toFixed(2)),
-            status: success ? "PROFIT" : "LOSS",
-            potentialBuyZone,
-            signalStrength: strInfo.strength
-          });
+          currentTrade = null;
         }
+      }
+
+      // If there's an open trade at the end
+      if (currentTrade && currentTrade.entryDate >= cutoffStr) {
+        const entryDate = currentTrade.entryDate;
+        const entryPrice = currentTrade.entryPrice;
+
+        let extremePrice = entryPrice;
+        const entryCandleIdx = allStockCandles.findIndex(c => c.date === entryDate);
+        if (entryCandleIdx !== -1) {
+          const startLookback = Math.max(0, entryCandleIdx - 20);
+          for (let cIdx = startLookback; cIdx < entryCandleIdx; cIdx++) {
+            if (allStockCandles[cIdx].high > extremePrice) extremePrice = allStockCandles[cIdx].high;
+          }
+        }
+
+        let targetPrice = isBearishScanner ? entryPrice * 0.90 : (extremePrice > entryPrice * 1.04 ? extremePrice : entryPrice * 1.10);
+        let stopLossPrice = isBearishScanner ? (extremePrice > entryPrice * 1.04 ? extremePrice : entryPrice * 1.06) : entryPrice * 0.94;
+
+        const latestCandle = allStockCandles[allStockCandles.length - 1];
+        const currentPrice = latestCandle.close;
+        const pnlPct = isBearishScanner ? ((entryPrice - currentPrice) / entryPrice) * 100 : ((currentPrice - entryPrice) / entryPrice) * 100;
+        const pnlAmt = isBearishScanner ? entryPrice - currentPrice : currentPrice - entryPrice;
+
+        const strInfo = getSignalStrengthInfo(allStockCandles, entryDate, currentTrade.ribbonBullishCount);
+
+        trades.push({
+          id: `t_open_${stock.symbol}_${entryDate}`,
+          symbol: stock.symbol,
+          name: stock.name,
+          type: isBearishScanner ? "SELL" : "BUY",
+          entryDate,
+          entryPrice: Number(entryPrice.toFixed(2)),
+          exitDate: "—",
+          exitPrice: null,
+          currentPrice: Number(currentPrice.toFixed(2)),
+          targetPrice: Number(targetPrice.toFixed(2)),
+          stopLossPrice: Number(stopLossPrice.toFixed(2)),
+          pnlAmount: Number(pnlAmt.toFixed(2)),
+          pnlPct: Number(pnlPct.toFixed(2)),
+          status: "OPEN",
+          potentialBuyZone: "—",
+          signalStrength: strInfo.strength
+        });
       }
     });
   }

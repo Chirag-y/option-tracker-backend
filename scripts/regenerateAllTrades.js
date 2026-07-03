@@ -69,40 +69,41 @@ async function generate() {
 
              // OPTIONS LOGIC
              let optResult = null;
-             if (sig && (sig.signal === 'LONG' || sig.signal === 'SHORT')) {
-                 const currentCandleIndex = candles.findIndex(c => c.date === candle.date);
-                 const trackerCandles = candles.slice(0, currentCandleIndex + 1);
-                 
-                 // Compute simple indicators for options
-                 const closes = trackerCandles.map(c => c.close);
-                 const calcEma = (period) => {
-                     let m = 2 / (period + 1), ema = closes[0];
-                     for(let i = 1; i < closes.length; i++) ema = (closes[i] - ema) * m + ema;
-                     return ema;
-                 };
-                 const rsiCalc = () => {
-                     if (closes.length < 15) return 50;
-                     let gains = 0, losses = 0;
-                     for(let i = closes.length - 14; i < closes.length; i++) {
-                         const diff = closes[i] - closes[i-1];
-                         if (diff > 0) gains += diff; else losses -= diff;
-                     }
-                     const rs = (gains / 14) / (losses / 14 || 1);
-                     return 100 - (100 / (1 + rs));
-                 };
+             let ind = null;
+             
+             const currentCandleIndex = candles.findIndex(c => c.date === candle.date);
+             const trackerCandles = candles.slice(0, currentCandleIndex + 1);
+             const closes = trackerCandles.map(c => c.close);
+             const calcEma = (period) => {
+                 let m = 2 / (period + 1), ema = closes[0];
+                 for(let i = 1; i < closes.length; i++) ema = (closes[i] - ema) * m + ema;
+                 return ema;
+             };
+             const rsiCalc = () => {
+                 if (closes.length < 15) return 50;
+                 let gains = 0, losses = 0;
+                 for(let i = closes.length - 14; i < closes.length; i++) {
+                     const diff = closes[i] - closes[i-1];
+                     if (diff > 0) gains += diff; else losses -= diff;
+                 }
+                 const rs = (gains / 14) / (losses / 14 || 1);
+                 return 100 - (100 / (1 + rs));
+             };
 
-                 const ind = {
-                     currentEma20: calcEma(20),
-                     currentEma50: calcEma(50),
-                     currentEma200: calcEma(200),
-                     ema20Rising: (calcEma(20) > calcEma(20) * 0.999), // rough estimate
-                     currentRsi: rsiCalc(),
-                     avgVol20: trackerCandles.slice(-20).reduce((sum, c) => sum + c.volume, 0) / 20,
-                     pdh: Math.max(...trackerCandles.slice(-75).map(c=>c.high)),
-                     previousDayLow: Math.min(...trackerCandles.slice(-75).map(c=>c.low)),
-                     adx: 25,
-                     vwap: candle.close
-                 };
+             ind = {
+                 currentEma20: calcEma(20),
+                 currentEma50: calcEma(50),
+                 currentEma200: calcEma(200),
+                 ema20Rising: (calcEma(20) > calcEma(20) * 0.999), // rough estimate
+                 currentRsi: rsiCalc(),
+                 avgVol20: trackerCandles.slice(-20).reduce((sum, c) => sum + c.volume, 0) / 20,
+                 pdh: Math.max(...trackerCandles.slice(-75).map(c=>c.high)),
+                 previousDayLow: Math.min(...trackerCandles.slice(-75).map(c=>c.low)),
+                 adx: 25,
+                 vwap: candle.close
+             };
+
+             if (sig && (sig.signal === 'LONG' || sig.signal === 'SHORT')) {
                  const liveData = { ltp: candle.close, volume: candle.volume, changePercent: 1.5, high: candle.high, low: candle.low };
                  const marketOverview = { niftyChangePercent: 0.5 };
                  
@@ -132,6 +133,29 @@ async function generate() {
              }
 
              // Handle Options Trades
+             
+             // Check EMA Trailing Stop Exits
+             if (activeOptBullish && candle.close < ind.currentEma20) {
+                 activeOptBullish.status = 'CLOSED'; activeOptBullish.closedAt = dateObj; activeOptBullish.exitPrice = candle.close;
+                 activeOptBullish.pnlPct = ((candle.close - activeOptBullish.entryPrice) / activeOptBullish.entryPrice) * 100;
+                 await FoActiveTrade.create(activeOptBullish); count++; activeOptBullish = null;
+             }
+             if (activeOptBearish && candle.close > ind.currentEma20) {
+                 activeOptBearish.status = 'CLOSED'; activeOptBearish.closedAt = dateObj; activeOptBearish.exitPrice = candle.close;
+                 activeOptBearish.pnlPct = ((activeOptBearish.entryPrice - candle.close) / activeOptBearish.entryPrice) * 100;
+                 await FoActiveTrade.create(activeOptBearish); count++; activeOptBearish = null;
+             }
+             if (activeFoBullish && candle.close < ind.currentEma20) {
+                 activeFoBullish.status = 'CLOSED'; activeFoBullish.closedAt = dateObj; activeFoBullish.exitPrice = candle.close;
+                 activeFoBullish.pnlPct = ((candle.close - activeFoBullish.entryPrice) / activeFoBullish.entryPrice) * 100;
+                 await FoActiveTrade.create(activeFoBullish); count++; activeFoBullish = null;
+             }
+             if (activeFoBearish && candle.close > ind.currentEma20) {
+                 activeFoBearish.status = 'CLOSED'; activeFoBearish.closedAt = dateObj; activeFoBearish.exitPrice = candle.close;
+                 activeFoBearish.pnlPct = ((activeFoBearish.entryPrice - candle.close) / activeFoBearish.entryPrice) * 100;
+                 await FoActiveTrade.create(activeFoBearish); count++; activeFoBearish = null;
+             }
+
              if (optResult && optResult.triggered && optResult.direction === 'BULLISH') {
                 if (activeOptBearish) {
                    activeOptBearish.status = 'CLOSED'; activeOptBearish.closedAt = dateObj; activeOptBearish.exitPrice = candle.close;

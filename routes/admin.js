@@ -1,5 +1,7 @@
 const router = require("express").Router();
 const User = require("../models/User");
+const PasswordResetRequest = require("../models/PasswordResetRequest");
+const bcrypt = require("bcryptjs");
 const auth = require("../middlewares/auth.middleware");
 const recalculateTeam = require("../utils/recalculateTeam");
 
@@ -20,6 +22,9 @@ const ensureAdmin = async (req, res, next) => {
 router.get("/overview", auth, ensureAdmin, async (req, res) => {
   try {
     const users = await User.find().select("-password").sort({ createdAt: -1 });
+    const passwordResetRequests = await PasswordResetRequest.find({ status: "PENDING" })
+      .sort({ createdAt: -1 })
+      .lean();
     const teams = {};
     users.forEach((u) => {
       if (!teams[u.teamCode]) {
@@ -37,7 +42,8 @@ router.get("/overview", auth, ensureAdmin, async (req, res) => {
 
     res.json({
       teams: Object.values(teams).sort((a, b) => a.teamCode.localeCompare(b.teamCode)),
-      users
+      users,
+      passwordResetRequests
     });
   } catch (err) {
     res.status(500).json({ message: "Failed to load admin overview" });
@@ -88,6 +94,66 @@ router.patch("/users/:id/verify", auth, ensureAdmin, async (req, res) => {
     res.json({ message: "User verification updated", user: { id: user._id, isVerified: user.isVerified } });
   } catch (err) {
     res.status(500).json({ message: "Failed to update verification" });
+  }
+});
+
+router.patch("/password-reset-requests/:id/resolve", auth, ensureAdmin, async (req, res) => {
+  try {
+    const { tempPassword } = req.body;
+    if (!tempPassword || String(tempPassword).length < 6) {
+      return res.status(400).json({ message: "tempPassword must be at least 6 characters" });
+    }
+
+    const request = await PasswordResetRequest.findById(req.params.id);
+    if (!request) return res.status(404).json({ message: "Password reset request not found" });
+    if (request.status !== "PENDING") {
+      return res.status(400).json({ message: `Request already ${request.status.toLowerCase()}` });
+    }
+
+    const user = await User.findById(request.userId);
+    if (!user) return res.status(404).json({ message: "User not found" });
+
+    user.password = await bcrypt.hash(String(tempPassword), 10);
+    user.mustChangePassword = true;
+    await user.save();
+
+    request.status = "RESOLVED";
+    request.resolvedAt = new Date();
+    request.resolvedBy = req.user.id;
+    await request.save();
+
+    await PasswordResetRequest.updateMany(
+      { userId: user._id, status: "PENDING", _id: { $ne: request._id } },
+      { $set: { status: "REJECTED", resolvedAt: new Date(), resolvedBy: req.user.id, adminNote: "Superseded by another reset" } }
+    );
+
+    res.json({
+      message: "Temporary password set. Share it with the user securely. They must change it after login.",
+      tempPassword: String(tempPassword),
+      user: { id: user._id, name: user.name, email: user.email, teamCode: user.teamCode }
+    });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to resolve password reset request" });
+  }
+});
+
+router.patch("/password-reset-requests/:id/reject", auth, ensureAdmin, async (req, res) => {
+  try {
+    const request = await PasswordResetRequest.findById(req.params.id);
+    if (!request) return res.status(404).json({ message: "Password reset request not found" });
+    if (request.status !== "PENDING") {
+      return res.status(400).json({ message: `Request already ${request.status.toLowerCase()}` });
+    }
+
+    request.status = "REJECTED";
+    request.resolvedAt = new Date();
+    request.resolvedBy = req.user.id;
+    request.adminNote = String(req.body?.note || "").trim();
+    await request.save();
+
+    res.json({ message: "Password reset request rejected" });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to reject password reset request" });
   }
 });
 
